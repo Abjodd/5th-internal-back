@@ -1,104 +1,141 @@
-// Wrapper around the "Instagram Scraper Stable API" on RapidAPI.
-// Kept isolated in this one file: if you switch providers or the response
-// shape doesn't match (these scraper APIs are not officially documented and
-// fields vary), only this file needs editing — not the routes or frontend.
+/**
+ * Instagram profile fetch — instagram-social.p.rapidapi.com
+ *
+ * GET /v1/profile?username={username}
+ *
+ * Confirmed real endpoint (RapidAPI Playground example response for
+ * "mrbeast"). Response shape:
+ * {
+ *   meta: { version, status, copywrite, username, user_id },
+ *   body: {
+ *     id, username, full_name, is_verified, is_private, is_business,
+ *     profile_pic, ...(21 keys total — likely includes follower_count,
+ *     following_count, media_count, biography, category, external_url,
+ *     but not all confirmed yet — logging raw body below to verify)
+ *   }
+ * }
+ *
+ * NOTE: the exact query param name is assumed to be "username" based on
+ * this API's convention (the /v1/search endpoint uses "search"). If this
+ * 400s, check the Params tab on RapidAPI's v1/profile page for the real
+ * param name and swap PARAM_NAME below.
+ */
+import "dotenv/config";
 
-const RAPIDAPI_HOST = "instagram-scraper-stable-api.p.rapidapi.com";
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const HOST = "instagram-social.p.rapidapi.com";
+const KEY  = process.env.RAPIDAPI_KEY;
+const DEBUG = process.env.IG_DEBUG !== "0";
+const PARAM_NAME = "username"; // <-- change this if RapidAPI's Params tab shows a different name
 
-// Pull a username out of a full profile URL or handle (@user, user, or full link)
-function extractUsername(input) {
-  if (!input) return null;
-  let s = input.trim();
-  s = s.replace(/^@/, "");
-  const m = s.match(/instagram\.com\/([^/?#]+)/i);
-  if (m) return m[1];
-  return s;
+function log(...args) {
+  if (DEBUG) console.log("[instagramFetch]", ...args);
 }
 
-// Try a list of possible key paths (different scraper responses use
-// different field names) and return the first defined value.
-function pick(obj, paths) {
-  for (const path of paths) {
-    const val = path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
-    if (val !== undefined && val !== null) return val;
+function extractUsername(input) {
+  if (!input) return null;
+  const s = input.trim().replace(/^@/, "");
+  const m = s.match(/instagram\.com\/([^/?#]+)/i);
+  return m ? m[1] : s;
+}
+
+function toNumberOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+async function callProfile(username) {
+  const qs = new URLSearchParams({ [PARAM_NAME]: username }).toString();
+  const url = `https://${HOST}/v1/profile?${qs}`;
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": HOST,
+        "x-rapidapi-key": KEY,
+      },
+    });
+  } catch (e) {
+    log("network error:", e.message);
+    return { error: `Network error: ${e.message}` };
   }
-  return null;
+
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    log(`non-JSON response (status ${res.status}):`, text.slice(0, 300));
+    return { error: `Non-JSON response (status ${res.status})`, raw: text };
+  }
+
+  log(`status=${res.status} body=`, JSON.stringify(json).slice(0, 1500));
+
+  if (res.status !== 200) {
+    return { error: json?.message || json?.meta?.message || `Request failed with status ${res.status}`, raw: json };
+  }
+
+  return { data: json };
+}
+
+function parseProfile(raw) {
+  const body = raw?.body || raw;
+  if (!body || typeof body !== "object") return null;
+
+  // Log the full key list once so we can see the real field names for
+  // follower/following/media counts and extend this list precisely.
+  log("body keys:", Object.keys(body));
+
+  const followers = body.follower_count ?? body.followers_count ?? body.followers ?? null;
+  const following = body.following_count ?? body.followings_count ?? body.following ?? null;
+  const posts     = body.media_count ?? body.posts_count ?? body.post_count ?? null;
+
+  return {
+    id:             body.id ?? null,
+    username:       body.username ?? null,
+    fullName:       body.full_name ?? null,
+    bio:            body.biography ?? body.bio ?? null,
+    category:       body.category ?? null,
+    externalUrl:    body.external_url ?? null,
+    followers:      toNumberOrNull(followers),
+    following:      toNumberOrNull(following),
+    posts:          toNumberOrNull(posts),
+    isVerified:     !!body.is_verified,
+    isPrivate:      !!body.is_private,
+    isBusiness:     !!body.is_business,
+    profilePic:     body.profile_pic ?? body.profile_pic_url ?? null,
+    fetchedAt:      new Date().toISOString(),
+    // Keep the full raw body too, so nothing is lost while we confirm
+    // the remaining field names (21 keys total, not all mapped above yet).
+    _raw:           body,
+  };
 }
 
 export async function fetchInstagramProfile(usernameOrUrl) {
-  if (!RAPIDAPI_KEY) {
-    return { error: "RAPIDAPI_KEY is not set in backend/.env — add it to enable Instagram auto-fetch." };
+  if (!KEY) {
+    return { error: "RAPIDAPI_KEY not set in backend/.env" };
   }
+
   const username = extractUsername(usernameOrUrl);
   if (!username) {
-    return { error: "Could not parse a username from that Instagram link/handle." };
+    return { error: "Could not parse a username from that link/handle." };
   }
 
-  const url = `https://${RAPIDAPI_HOST}/get_ig_user_about.php?username_or_url=${encodeURIComponent(username)}`;
-
-  let res, raw;
-  try {
-    res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": RAPIDAPI_KEY,
-      },
-    });
-    raw = await res.text();
-  } catch (err) {
-    return { error: `Network error calling Instagram API: ${err.message}` };
+  const result = await callProfile(username);
+  if (result.error) {
+    return { error: result.error, username, raw: result.raw ?? null };
   }
 
-  if (!res.ok) {
-    return { error: `Instagram API returned ${res.status}: ${raw.slice(0, 300)}` };
-  }
-
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return { error: "Instagram API did not return valid JSON.", raw: raw.slice(0, 500) };
-  }
-
-  // The actual payload may be nested under "data", "result", "user", or be the root object.
-  const root = pick(data, ["data", "result", "user", "graphql.user"]) || data;
-
-  const followers = pick(root, [
-    "follower_count", "followers", "followers_count",
-    "edge_followed_by.count", "follower",
-  ]);
-  const following = pick(root, ["following_count", "following", "edge_follow.count"]);
-  const posts = pick(root, ["media_count", "posts_count", "edge_owner_to_timeline_media.count"]);
-  const fullName = pick(root, ["full_name", "fullname", "name"]);
-  const bio = pick(root, ["biography", "bio"]);
-  const isVerified = pick(root, ["is_verified", "verified"]);
-  const profilePic = pick(root, ["profile_pic_url", "profile_pic_url_hd", "avatar"]);
-  const avgLikes = pick(root, ["avg_likes", "average_likes"]); // rarely present from "about" endpoints
-  const engagementRate = pick(root, ["engagement_rate", "avg_engagement_rate"]);
-
-  if (followers == null && fullName == null && bio == null) {
-    // Nothing recognizable came back — surface the raw shape so the mapping
-    // in this file can be corrected quickly.
+  const parsed = parseProfile(result.data);
+  if (!parsed) {
     return {
-      error: "Got a response but couldn't find recognizable profile fields. Raw response attached.",
-      raw: data,
+      error: "Got a 200 response but couldn't find a usable body — check `raw`.",
+      username,
+      raw: result.data,
     };
   }
 
-  return {
-    username,
-    fullName: fullName || null,
-    bio: bio || null,
-    followers: followers != null ? Number(followers) : null,
-    following: following != null ? Number(following) : null,
-    posts: posts != null ? Number(posts) : null,
-    avgLikes: avgLikes != null ? Number(avgLikes) : null,
-    engagementRate: engagementRate != null ? Number(engagementRate) : null,
-    isVerified: !!isVerified,
-    profilePic: profilePic || null,
-    fetchedAt: new Date().toISOString(),
-  };
+  return { username, ...parsed };
 }

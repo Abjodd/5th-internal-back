@@ -8,7 +8,7 @@ import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
 import Quote from "./models/Quote.js";
 import RegistryEntry from "./models/RegistryEntry.js";
-
+import { fetchInstagramProfile } from "./instagramFetchHiker.js";
 const app = express();
 
 app.use(
@@ -168,8 +168,6 @@ app.patch("/api/findings/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-import { fetchInstagramProfile } from "./instagramFetch.js";
 
 // ── Instagram lookup (Add Creator auto-fetch) ───────────────────────────────
 // GET /api/instagram?handle=https://www.instagram.com/someuser/
