@@ -7,7 +7,8 @@
     "seed": "node seed.js",
     "seed:clients": "node seed_clients.js",
     "seed:findings": "node seed_findings.js",
-    "seed:billing": "node seed_billing.js"
+    "seed:billing": "node seed_billing.js",
+    "seed:all": "node seed_all.js"
   },
   "dependencies": {
     "express": "^4.19.2",
