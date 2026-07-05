@@ -8,7 +8,7 @@ import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
 import Quote from "./models/Quote.js";
 import RegistryEntry from "./models/RegistryEntry.js";
-import { fetchInstagramProfile } from "./InstagramFetchHiker.js";
+import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 const app = express();
 
 app.use(
