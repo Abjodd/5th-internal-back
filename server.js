@@ -25,8 +25,12 @@ app.use(express.json({ limit: "5mb" }));
 // so one factory avoids repeating the same 4 routes 6 times.
 function registerCrudRoutes(basePath, Model) {
   app.get(basePath, async (req, res) => {
-    const docs = await Model.find().lean();
-    res.json(docs.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+    try {
+      const docs = await Model.find().lean();
+      res.json(docs.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.post(basePath, async (req, res) => {
@@ -69,9 +73,15 @@ registerCrudRoutes("/api/registry", RegistryEntry);
 
 // GET /api/campaigns — list all campaigns
 app.get("/api/campaigns", async (req, res) => {
-  const campaigns = await Campaign.find().lean();
-  // map _id -> id so the frontend shape stays identical
-  res.json(campaigns.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  try {
+    const q = {};
+    if (req.query.client) q.client = req.query.client;
+    if (req.query.stage)  q.stage  = req.query.stage;
+    const campaigns = await Campaign.find(q).lean();
+    res.json(campaigns.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/campaigns — create a new campaign
