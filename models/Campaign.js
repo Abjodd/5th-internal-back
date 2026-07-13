@@ -17,6 +17,7 @@ const CampaignSchema = new mongoose.Schema(
     _id: { type: String }, // e.g. "c1" — keeps frontend ids stable
     name: String,
     client: String,
+    brandId: String, // FK to Client._id — "client" stays as a denormalized display name
     service: String,
     region: String,
     stage: String,
@@ -26,7 +27,7 @@ const CampaignSchema = new mongoose.Schema(
     numReq: Number,
     start: String,
     end: String,
-    bmId: String,
+    amId: String,
     cmId: String,
     eaId: String,
     brief: mongoose.Schema.Types.Mixed,
