@@ -8,12 +8,14 @@
     "seed:clients": "node seed_clients.js",
     "seed:findings": "node seed_findings.js",
     "seed:billing": "node seed_billing.js",
-    "seed:all": "node seed_all.js"
+    "seed:users": "node seed_users.js",
+    "seed:all": "node seed_all.js && node seed_users.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "mongoose": "^8.5.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
+    "pdfkit": "^0.19.1"
   }
 }
