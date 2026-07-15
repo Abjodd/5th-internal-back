@@ -3,6 +3,9 @@ import cors from "cors";
 import { connectDB } from "./db.js";
 import Campaign from "./models/Campaign.js";
 import Invoice from "./models/Invoice.js";
+import invoicePdfRoutes from "./routes/invoicePdf.js";
+import authRoutes from "./routes/auth.js";
+import influencerRoutes from "./routes/influencers.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -19,6 +22,16 @@ app.use(
 );
 
 app.use(express.json({ limit: "5mb" }));
+
+// ── Feature route modules (see routes/) ─────────────────────────────────────
+// invoicePdf: POST/GET /api/invoices/:invoiceNo/pdf — pdfkit render + GridFS storage
+// auth:       /api/auth/login, /api/auth/portal-login, /api/users, /api/brand-credentials
+// influencers:/api/influencers — creator directory aggregated across campaigns
+// NOTE: mounted before registerCrudRoutes("/api/invoices") below so the more
+// specific /pdf routes win over the generic /api/invoices/:id matchers.
+app.use(invoicePdfRoutes);
+app.use(authRoutes);
+app.use(influencerRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
@@ -251,19 +264,14 @@ app.get("/api/portal/analytics", async (req, res) => {
     const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
 
     // ── month-bucket helpers ──────────────────────────────────────────────────
-    const MONTHS = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+    // Campaign.start/end are stored as ISO ("YYYY-MM-DD"). Legacy rows that
+    // predated this (month-first "Mar 1", day-first "3 Jul") were normalized
+    // to ISO via a one-time migration.
+    const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
     function parseHuman(s) {
-      if (!s) return null;
-      const iso = new Date(s);
-      if (/\d{4}/.test(s) && !isNaN(iso)) return iso;
-      const m = String(s).match(/^([A-Za-z]{3,})\s+(\d{1,2})/);
-      if (!m) return null;
-      const mon = MONTHS[m[1].slice(0,3).toLowerCase()];
-      if (mon == null) return null;
-      const now = new Date();
-      let d = new Date(now.getFullYear(), mon, parseInt(m[2], 10));
-      if (d > now) d = new Date(now.getFullYear() - 1, mon, parseInt(m[2], 10));
-      return d;
+      if (!s || !ISO_DATE.test(s)) return null;
+      const d = new Date(`${s}T00:00:00`);
+      return isNaN(d) ? null : d;
     }
     function monthKey(d) {
       return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
@@ -313,15 +321,16 @@ app.get("/api/portal/analytics", async (req, res) => {
       const clicks      = Math.round(engagements * 0.08);
       const spend       = Number(c.budget) || 0;
 
-      if (bucket) {
-        bucket.spend       += spend;
-        bucket.reach       += reach;
-        bucket.engagements += engagements;
-        bucket.impressions += impressions;
-        bucket.clicks      += clicks;
-      }
+      if (!bucket) return; // campaign starts outside the selected period
 
-      // Spend split by service
+      bucket.spend       += spend;
+      bucket.reach       += reach;
+      bucket.engagements += engagements;
+      bucket.impressions += impressions;
+      bucket.clicks      += clicks;
+
+      // Spend split by service — same period filter as the timeseries above,
+      // so "Spend Split · selected period" actually reflects the period.
       const svc = (c.service || "Other").trim();
       spendByService[svc] = (spendByService[svc] || 0) + spend;
     });
