@@ -7,14 +7,17 @@
  * Mirrors the USERS directory that used to live in
  * 5th-internal-front/src/context/AuthContext.jsx and the PORTAL_USERS in
  * 5th-avenue-client-front — the DB is now the single source of truth for
- * logins. Passwords below are hashed (sha256 → hashKey) before insert;
- * plaintext is never stored.
+ * logins. Passwords are stored as hashKey (sha256, for login checks) plus
+ * passKey (AES-256-GCM, so the founder Auth page can reveal them); the
+ * plaintext itself is never stored. Ids are sequential in the u{n} / bc{n}
+ * format — the backend continues the sequence for records added via the
+ * Auth page.
  */
 import "dotenv/config";
 import { connectDB } from "./db.js";
 import User from "./models/User.js";
 import BrandCredential from "./models/BrandCredential.js";
-import { hashPassword } from "./routes/auth.js";
+import { hashPassword, encryptPassword } from "./routes/auth.js";
 
 // ── INTERNAL USERS ───────────────────────────────────────────────────────────
 const USERS = [
@@ -50,13 +53,13 @@ async function run() {
 
   await User.deleteMany({});
   await User.insertMany(
-    USERS.map(({ id, password, ...rest }) => ({ ...rest, _id: id, hashKey: hashPassword(password) }))
+    USERS.map(({ id, password, ...rest }) => ({ ...rest, _id: id, hashKey: hashPassword(password), passKey: encryptPassword(password) }))
   );
   console.log(`✓ users: ${USERS.length}`);
 
   await BrandCredential.deleteMany({});
   await BrandCredential.insertMany(
-    BRAND_CREDENTIALS.map(({ id, password, ...rest }) => ({ ...rest, _id: id, hashKey: hashPassword(password) }))
+    BRAND_CREDENTIALS.map(({ id, password, ...rest }) => ({ ...rest, _id: id, hashKey: hashPassword(password), passKey: encryptPassword(password) }))
   );
   console.log(`✓ brand credentials: ${BRAND_CREDENTIALS.length}`);
 

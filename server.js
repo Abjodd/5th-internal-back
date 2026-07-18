@@ -247,8 +247,12 @@ app.get("/api/instagram", async (req, res) => {
 
 // ── Client Portal Analytics ─────────────────────────────────────────────────
 // GET /api/portal/analytics?client=NAME&from=ISO&to=ISO
-// Returns monthly spend+reach+engagement timeseries and spend-by-service split.
-// Reach  = sum of creator followers (audience reach potential per campaign month)
+// Returns one dated event per campaign in the period (spend/reach/engagement
+// metrics, dated by campaign start) plus a spend-by-service split. The portal
+// buckets events into daily/weekly/monthly series client-side (see
+// 5th-avenue-client-front src/lib/dates.js bucketSeries), so switching
+// granularity never needs a refetch.
+// Reach  = sum of creator followers (audience reach potential per campaign)
 // Engagements = reach × avgER across creators
 // Impressions = reach × 0.12 (estimated: 12% of follower base sees each post)
 // Clicks = engagements × 0.08 (estimated: 8% click-through on engaged audience)
@@ -263,42 +267,22 @@ app.get("/api/portal/analytics", async (req, res) => {
 
     const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
 
-    // ── month-bucket helpers ──────────────────────────────────────────────────
     // Campaign.start/end are stored as ISO ("YYYY-MM-DD"). Legacy rows that
     // predated this (month-first "Mar 1", day-first "3 Jul") were normalized
     // to ISO via a one-time migration.
     const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-    function parseHuman(s) {
+    function parseISO(s) {
       if (!s || !ISO_DATE.test(s)) return null;
       const d = new Date(`${s}T00:00:00`);
       return isNaN(d) ? null : d;
     }
-    function monthKey(d) {
-      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
-    }
-    function monthLabel(key) {
-      const [y, m] = key.split("-");
-      const NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-      return `${NAMES[parseInt(m,10)-1]} '${String(y).slice(2)}`;
-    }
 
-    // ── build all months between from..to ────────────────────────────────────
-    const monthMap = new Map();
-    const cur = new Date(from.getFullYear(), from.getMonth(), 1);
-    while (cur <= to) {
-      const k = monthKey(cur);
-      monthMap.set(k, { month: k, label: monthLabel(k), spend: 0, reach: 0, engagements: 0, impressions: 0, clicks: 0 });
-      cur.setMonth(cur.getMonth() + 1);
-    }
-
-    // ── per-service spend split ───────────────────────────────────────────────
+    const events = [];
     const spendByService = {};
 
     campaigns.forEach(c => {
-      const startDate = parseHuman(c.start);
-      if (!startDate) return;
-      const key = monthKey(startDate);
-      const bucket = monthMap.get(key);
+      const startDate = parseISO(c.start);
+      if (!startDate || startDate < from || startDate > to) return;
 
       // Compute aggregate reach + ER across creators
       const creators = c.creators || [];
@@ -321,22 +305,19 @@ app.get("/api/portal/analytics", async (req, res) => {
       const clicks      = Math.round(engagements * 0.08);
       const spend       = Number(c.budget) || 0;
 
-      if (!bucket) return; // campaign starts outside the selected period
+      events.push({
+        date: c.start, campaign: c.name,
+        spend, reach, engagements, impressions, clicks,
+      });
 
-      bucket.spend       += spend;
-      bucket.reach       += reach;
-      bucket.engagements += engagements;
-      bucket.impressions += impressions;
-      bucket.clicks      += clicks;
-
-      // Spend split by service — same period filter as the timeseries above,
-      // so "Spend Split · selected period" actually reflects the period.
+      // Spend split by service — same period filter as the events above, so
+      // "Spend Split · selected period" actually reflects the period.
       const svc = (c.service || "Other").trim();
       spendByService[svc] = (spendByService[svc] || 0) + spend;
     });
 
     res.json({
-      monthly: [...monthMap.values()],
+      events,
       spendByService,
       note: "reach=followers sum; engagements=reach×avgER; impressions≈reach×0.12; clicks≈engagements×0.08",
     });
