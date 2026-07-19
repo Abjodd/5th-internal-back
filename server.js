@@ -12,6 +12,8 @@ import ClientPO from "./models/ClientPO.js";
 import Quote from "./models/Quote.js";
 import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
+import { fetchYouTubeChannel } from "./youtubeFetch.js";
+import { fetchPostMetrics } from "./postMetrics.js";
 const app = express();
 
 app.use(
@@ -241,6 +243,28 @@ app.get("/api/instagram", async (req, res) => {
   const handle = req.query.handle;
   if (!handle) return res.status(400).json({ error: "handle query param is required" });
   const result = await fetchInstagramProfile(handle);
+  if (result.error) return res.status(502).json(result);
+  res.json(result);
+});
+
+// ── YouTube channel lookup (Add Creator auto-fetch, YouTube creators) ───────
+// GET /api/youtube?handle=https://www.youtube.com/@somechannel (or @handle)
+// Same response shape as /api/instagram so the frontend card renders both.
+app.get("/api/youtube", async (req, res) => {
+  const handle = req.query.handle;
+  if (!handle) return res.status(400).json({ error: "handle query param is required" });
+  const result = await fetchYouTubeChannel(handle);
+  if (result.error) return res.status(502).json(result);
+  res.json(result);
+});
+
+// ── Post metrics (Deliverables tab tracking) ────────────────────────────────
+// GET /api/post-metrics?url=&platform= — dispatches on the link/platform:
+// Instagram via HikerAPI, YouTube via the Data API.
+app.get("/api/post-metrics", async (req, res) => {
+  const { url, platform } = req.query;
+  if (!url) return res.status(400).json({ error: "url query param is required" });
+  const result = await fetchPostMetrics(url, platform);
   if (result.error) return res.status(502).json(result);
   res.json(result);
 });

@@ -86,4 +86,49 @@ router.get("/api/influencers", async (req, res) => {
   }
 });
 
+// PATCH /api/influencers/:id — founder edit from the directory.
+// The directory has no collection of its own (rows are aggregated from
+// campaign.creators above), so the patch is propagated to the creator's entry
+// in every non-deleted campaign, matched by the same dedupe key the GET uses.
+// Only profile/billing fields propagate — per-campaign fields (fee, status,
+// concept/demo/live, tracking, invoiceNo) belong to each campaign and are
+// deliberately not editable from the directory.
+const EDITABLE = [
+  "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
+  "niche", "state", "phone", "payType", "payId", "personalDetails",
+];
+
+router.patch("/api/influencers/:id", async (req, res) => {
+  try {
+    const key = String(req.params.id).toLowerCase().trim();
+    const patch = {};
+    for (const k of EDITABLE) if (k in req.body) patch[k] = req.body[k];
+    if (!Object.keys(patch).length) return res.status(400).json({ error: "no editable fields in body" });
+
+    const campaigns = await Campaign.find({ deleted: { $ne: true } });
+    let touched = 0;
+    for (const camp of campaigns) {
+      let hit = false;
+      camp.creators = (camp.creators || []).map((cr) => {
+        if (String(cr.handle || cr.name || "").toLowerCase().trim() !== key) return cr;
+        hit = true;
+        return {
+          ...cr,
+          ...patch,
+          personalDetails: { ...(cr.personalDetails || {}), ...(patch.personalDetails || {}) },
+        };
+      });
+      if (hit) {
+        camp.markModified("creators"); // Mixed array — Mongoose can't detect the mutation
+        await camp.save();
+        touched++;
+      }
+    }
+    if (!touched) return res.status(404).json({ error: "influencer not found on any campaign" });
+    res.json({ id: key, updatedCampaigns: touched });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
