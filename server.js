@@ -5,7 +5,9 @@ import Campaign from "./models/Campaign.js";
 import Invoice from "./models/Invoice.js";
 import invoicePdfRoutes from "./routes/invoicePdf.js";
 import authRoutes from "./routes/auth.js";
-import influencerRoutes from "./routes/influencers.js";
+import creatorRoutes from "./routes/creators.js";
+import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
+import clientRequestRoutes from "./routes/clientRequests.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -28,12 +30,14 @@ app.use(express.json({ limit: "5mb" }));
 // ── Feature route modules (see routes/) ─────────────────────────────────────
 // invoicePdf: POST/GET /api/invoices/:invoiceNo/pdf — pdfkit render + GridFS storage
 // auth:       /api/auth/login, /api/auth/portal-login, /api/users, /api/brand-credentials
-// influencers:/api/influencers — creator directory aggregated across campaigns
+// creators:   /api/creators — creator directory aggregated across campaigns
+// clientReqs: /api/client-requests — brand landing-page signups (founder inbox)
 // NOTE: mounted before registerCrudRoutes("/api/invoices") below so the more
 // specific /pdf routes win over the generic /api/invoices/:id matchers.
 app.use(invoicePdfRoutes);
 app.use(authRoutes);
-app.use(influencerRoutes);
+app.use(creatorRoutes);
+app.use(clientRequestRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
@@ -96,32 +100,49 @@ app.get("/api/campaigns", async (req, res) => {
     if (req.query.stage)   q.stage   = req.query.stage;
     if (req.query.brandId) q.brandId = req.query.brandId;
     const campaigns = await Campaign.find(q).lean();
+    await hydrateCampaignCreators(campaigns);
     res.json(campaigns.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Denormalized creator_ids on a campaign — the same dedupe key the creators
+// directory keys on (keyOf, from creatorSync.js), so the mapping stays a
+// queryable index into the creators collection without ever drifting.
+const creatorIdsOf = (creators) =>
+  [...new Set((creators || []).map((cr) => cr.creatorId || keyOf(cr)).filter(Boolean))];
+
 // POST /api/campaigns — create a new campaign
 // Body is the full campaign object (id, name, client, ... as built in onCreate)
 app.post("/api/campaigns", async (req, res) => {
   const c = req.body;
   if (!c.id) return res.status(400).json({ error: "id is required" });
-  const doc = await Campaign.create({ ...c, _id: c.id });
-  const { _id, ...rest } = doc.toObject();
+  const creators = await splitCreatorsForStorage(c.creators);
+  const doc = await Campaign.create({ ...c, _id: c.id, creators, creatorIds: creatorIdsOf(creators) });
+  const [hydrated] = await hydrateCampaignCreators([doc.toObject()]);
+  const { _id, ...rest } = hydrated;
   res.status(201).json({ id: _id, ...rest });
 });
 
 // PATCH /api/campaigns/:id — partial update (brief, creators, stage, etc.)
+// When `creators` is touched, profile fields (name, handle, followers, ...)
+// are split out to the creators directory before saving — see creatorSync.js.
 app.patch("/api/campaigns/:id", async (req, res) => {
   try {
+    const patch = { ...req.body };
+    if ("creators" in patch) {
+      patch.creators = await splitCreatorsForStorage(patch.creators);
+      patch.creatorIds = creatorIdsOf(patch.creators);
+    }
     const updated = await Campaign.findByIdAndUpdate(
       req.params.id,
-      { $set: req.body },
+      { $set: patch },
       { new: true }
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
-    const { _id, ...rest } = updated;
+    const [hydrated] = await hydrateCampaignCreators([updated]);
+    const { _id, ...rest } = hydrated;
     res.json({ id: _id, ...rest });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -158,6 +179,7 @@ app.get("/api/portal/campaigns", async (req, res) => {
     const client = req.query.client;
     if (!client) return res.status(400).json({ error: "client query param is required" });
     const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
+    await hydrateCampaignCreators(campaigns);
     res.json(
       campaigns.map(({ _id, ...c }) => {
         for (const k of CAMPAIGN_PRIVATE) delete c[k];
