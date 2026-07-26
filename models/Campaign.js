@@ -34,7 +34,18 @@ const CampaignSchema = new mongoose.Schema(
     briefStatus: String,
     bmNote: String,
     cmNote: String,
+    // Slim, campaign-specific records only (fee, status, concept/demo/live,
+    // tracking, invoiceNo, ...) — each entry's `creatorId` is a FK into the
+    // `creators` collection (models/Creator.js), which owns the profile
+    // (name, handle, platform, followers, niche, personalDetails, ...).
+    // Split-on-write / hydrated-on-read by creatorSync.js so the API still
+    // returns one flat merged object per creator, same shape as always.
     creators: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    // Denormalized index into the creators directory — creatorIds[i] is the
+    // creatorId of creators[i]. Kept in step by the campaign POST/PATCH
+    // handlers so campaigns can be queried/joined by creator without scanning
+    // the embedded objects.
+    creatorIds: { type: [String], default: [] },
     genRounds: Number,
     sentToClient: Boolean,
     internalNotes: String,
