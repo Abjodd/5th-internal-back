@@ -8,6 +8,7 @@ import authRoutes from "./routes/auth.js";
 import creatorRoutes from "./routes/creators.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
+import creatorRequestRoutes from "./routes/creatorRequests.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -32,12 +33,14 @@ app.use(express.json({ limit: "5mb" }));
 // auth:       /api/auth/login, /api/auth/portal-login, /api/users, /api/brand-credentials
 // creators:   /api/creators — creator directory aggregated across campaigns
 // clientReqs: /api/client-requests — brand landing-page signups (founder inbox)
+// creatorReqs:/api/creator-requests — creator applications (founder inbox)
 // NOTE: mounted before registerCrudRoutes("/api/invoices") below so the more
 // specific /pdf routes win over the generic /api/invoices/:id matchers.
 app.use(invoicePdfRoutes);
 app.use(authRoutes);
 app.use(creatorRoutes);
 app.use(clientRequestRoutes);
+app.use(creatorRequestRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
