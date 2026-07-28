@@ -22,7 +22,7 @@ export const keyOf = (cr) => String(cr?.handle || cr?.name || "").toLowerCase().
 // igFetched, ...) is campaign-specific and stays embedded.
 export const PROFILE_FIELDS = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
-  "niche", "state", "phone", "payType", "payId", "personalDetails",
+  "niche", "state", "languages", "phone", "payType", "payId", "personalDetails",
 ];
 
 const pick = (obj, keys) => keys.reduce((o, k) => (k in (obj || {}) ? { ...o, [k]: obj[k] } : o), {});

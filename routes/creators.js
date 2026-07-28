@@ -15,14 +15,25 @@ const router = Router();
 
 router.get("/api/creators", async (req, res) => {
   try {
-    // The directory only ever lists creators currently on an active campaign
-    // — creatorIds (kept in step by the campaign routes) is the index, so no
-    // need to rebuild profiles from embedded objects on every read anymore.
+    // The creators collection is the source of truth for a creator's profile,
+    // and this endpoint no longer prunes it.
+    //
+    // It used to run `Creator.deleteMany({ _id: { $nin: activeKeys } })` here:
+    // soft-deleting a campaign dropped its creators out of activeKeys, so the
+    // next person to open this page hard-deleted them — permanently, taking
+    // personalDetails (PAN, bank account, IFSC, UPI) with them, while the
+    // campaign itself stayed restorable. A read endpoint should not destroy
+    // records, and campaign membership should not govern a creator's
+    // existence: the link runs Campaign.creatorIds -> Creator._id, one way,
+    // so a creator outlives any campaign that references them.
+    //
+    // activeKeys is still what "currently on a live campaign" means, and it
+    // still drives the campaign/brand joins below — it just no longer decides
+    // who gets to exist.
     const activeKeys = await Campaign.distinct("creatorIds", { deleted: { $ne: true } });
-    await Creator.deleteMany({ _id: { $nin: activeKeys } });
 
     const [creators, campaigns, invoices] = await Promise.all([
-      Creator.find({ _id: { $in: activeKeys } }).sort({ name: 1 }).lean(),
+      Creator.find({}).sort({ name: 1 }).lean(),
       Campaign.find({ creatorIds: { $in: activeKeys }, deleted: { $ne: true } })
         .select("name client brandId stage creators")
         .lean(),
@@ -52,11 +63,20 @@ router.get("/api/creators", async (req, res) => {
       invoices: [],
     }));
     // Brand filter narrows to creators who've worked with that brand, and
-    // their visible campaign appearances to just that brand.
+    // their visible campaign appearances to just that brand. A creator with
+    // no campaigns at all (e.g. just promoted from an application, not yet
+    // booked on anything) hasn't worked with *any* brand, so they're kept
+    // regardless of the filter rather than read as "not this brand" — only
+    // creators who are exclusively on OTHER brands' campaigns get dropped.
     if (req.query.brandId) {
       rows = rows
-        .map((r) => ({ ...r, campaigns: r.campaigns.filter((c) => c.brandId === req.query.brandId) }))
-        .filter((r) => r.campaigns.length);
+        .map((r) => ({
+          ...r,
+          _hadCampaigns: r.campaigns.length > 0,
+          campaigns: r.campaigns.filter((c) => c.brandId === req.query.brandId),
+        }))
+        .filter((r) => r.campaigns.length || !r._hadCampaigns)
+        .map(({ _hadCampaigns, ...r }) => r);
     }
 
     const byId = new Map(rows.map((r) => [r.id, r]));

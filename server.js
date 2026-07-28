@@ -23,6 +23,12 @@ app.use(
   cors({
     origin: true,
     credentials: true,
+    // Cache the CORS preflight for 24h. Without this the `cors` package sends
+    // no Access-Control-Max-Age, so Chrome falls back to its 5-second default
+    // and re-preflights almost every call — the frontends were paying two
+    // round trips per request (an OPTIONS beside every GET/POST) on a link
+    // where each trip costs ~150-250ms. 86400 is the ceiling Chrome honours.
+    maxAge: 86400,
   })
 );
 
@@ -166,16 +172,43 @@ app.delete("/api/campaigns/:id", async (req, res) => {
 });
 
 // ── Client Portal (read-only) ────────────────────────────────────────────────
-// GET /api/portal/campaigns?client=NAME — one client's campaigns with
-// internal-only fields stripped before they leave the building: money the
-// client shouldn't see (creator fees, creator budget), staff assignments and
-// notes, and payment identifiers.
+// GET /api/portal/campaigns?client=NAME — one client's campaigns, with
+// everything internal stripped before it leaves the building.
+//
+// Campaign fields are a denylist: money the client shouldn't see (creator
+// fees, creator budget), staff assignments and notes, and internal bookkeeping.
 const CAMPAIGN_PRIVATE = [
   "creatorBudget", "amId", "bmId", "cmId", "eaId", "brandId",
   "internalNotes", "amNote", "bmNote", "cmNote",
   "genRounds", "sentToClient", "timeline",
+  // Internal identifiers with no meaning to a client: who created the campaign
+  // (a staff teamId), the denormalized creator index, and the soft-delete
+  // bookkeeping that every query already filters on.
+  "createdBy", "creatorIds", "deleted", "deletedAt",
 ];
-const CREATOR_PRIVATE = ["fee", "phone", "payType", "payId", "dbId"];
+
+// Creator fields are an ALLOWLIST, deliberately — the opposite of the campaign
+// rule above, and the difference matters.
+//
+// Campaign and Creator are both `strict: false`, so a denylist here would make
+// every field anyone ever adds public by default. That is not hypothetical:
+// once creator profiles moved into their own collection, hydrateCampaignCreators
+// began merging the full profile — including `personalDetails` (PAN, bank
+// account number, IFSC, UPI id) — onto each campaign's creators[] on read. The
+// old denylist named `fee, phone, payType, payId, dbId` but not
+// `personalDetails`, so every client with a portal login was being served their
+// creators' bank and tax details in the JSON payload. The portal UI never
+// rendered them (see mapping.js toViewCreator), which is exactly why it went
+// unnoticed — the data was one devtools Network tab away the whole time.
+//
+// Add to this list only after checking the field is safe for a brand to read.
+const CREATOR_PUBLIC = [
+  // identity / audience — what the brand is buying
+  "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
+  "niche", "state", "languages",
+  // campaign-specific workflow the portal renders
+  "status", "concept", "demo", "live", "tracking", "deliverables",
+];
 
 app.get("/api/portal/campaigns", async (req, res) => {
   try {
@@ -186,11 +219,9 @@ app.get("/api/portal/campaigns", async (req, res) => {
     res.json(
       campaigns.map(({ _id, ...c }) => {
         for (const k of CAMPAIGN_PRIVATE) delete c[k];
-        c.creators = (c.creators || []).map((cr) => {
-          const safe = { ...cr };
-          for (const k of CREATOR_PRIVATE) delete safe[k];
-          return safe;
-        });
+        c.creators = (c.creators || []).map((cr) =>
+          CREATOR_PUBLIC.reduce((safe, k) => (k in cr ? { ...safe, [k]: cr[k] } : safe), {})
+        );
         return { id: _id, ...c };
       })
     );
