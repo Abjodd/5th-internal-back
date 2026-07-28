@@ -25,6 +25,12 @@ const CreatorSchema = new mongoose.Schema(
     avgER: Number,
     niche: String,
     state: String,
+    // Languages the creator publishes in. Collected on the public application
+    // form (models/CreatorRequest.js) and carried across on promotion. The
+    // client portal's Regional Map falls back to the primary language of the
+    // creator's state when this is empty, which is a guess — this is the
+    // creator's own answer.
+    languages: { type: [String], default: [] },
     phone: String,
     payType: String,
     payId: String,
