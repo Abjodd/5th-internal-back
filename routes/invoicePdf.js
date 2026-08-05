@@ -68,7 +68,7 @@ router.post("/api/invoices/:invoiceNo/pdf", async (req, res) => {
           creatorHandle: creator.handle || null,
           campaign: campaignId || null,
           brandId: brandId || null,
-          amount: creator.fee || 0,
+          amount: creator.cost ?? creator.fee ?? 0,
           payType: creator.payType || null,
           pdfFileId: fileId,
           pdfUrl,

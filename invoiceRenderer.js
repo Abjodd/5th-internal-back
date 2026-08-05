@@ -50,7 +50,7 @@ export function renderInvoicePdf({ creator, campaignName, invoiceNo, dated }) {
     doc.on("error", reject);
 
     const pd  = creator.personalDetails || {};
-    const fee = creator.fee || 0;
+    const fee = creator.cost ?? creator.fee ?? 0;
     const X = 40, W = 515;          // table left edge + width
     let y = 40;
 

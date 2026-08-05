@@ -50,7 +50,7 @@ router.get("/api/creators", async (req, res) => {
         const list = campaignsByKey.get(key) || [];
         list.push({
           id: camp._id, name: camp.name, client: camp.client, brandId: camp.brandId || null,
-          stage: camp.stage || null, fee: cr.fee ?? null, status: cr.status || null,
+          stage: camp.stage || null, cost: cr.cost ?? cr.fee ?? null, status: cr.status || null,
           concept: cr.concept || null, demo: cr.demo || null,
         });
         campaignsByKey.set(key, list);
