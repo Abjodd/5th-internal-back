@@ -17,6 +17,8 @@ import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
+import { startScheduler } from "./scheduler.js";
+import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 const app = express();
 
 app.use(
@@ -230,7 +232,11 @@ const CREATOR_PUBLIC = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
   "niche", "state", "languages",
   // campaign-specific workflow the portal renders
-  "status", "concept", "demo", "live", "tracking", "deliverables",
+  // `numDeliverables` is how many posts this creator owes — the brand is
+  // buying it, so it belongs in the client's view of the roster. `live` now
+  // carries a postUrls[] array alongside the postUrl the portal reads today;
+  // both travel under the one key.
+  "status", "concept", "demo", "live", "tracking", "deliverables", "numDeliverables",
 ];
 
 app.get("/api/portal/campaigns", async (req, res) => {
@@ -454,12 +460,26 @@ app.get("/api/portal/analytics", async (req, res) => {
   }
 });
 
+// POST /api/post-metrics/refresh-all — run the nightly job now.
+// Exists so the scheduled job can be verified (and re-run after an outage)
+// without waiting for midnight or redeploying. Returns the same summary the
+// scheduler logs.
+app.post("/api/post-metrics/refresh-all", async (req, res) => {
+  try {
+    res.json(await refreshAllPostMetrics());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 4000;
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
+  // After the DB is up — the jobs query Mongo directly.
+  startScheduler();
 });
 
 
