@@ -10,6 +10,7 @@
  * fetchYouTubeVideoMetrics(url)      — one video's stats for post tracking.
  */
 import "dotenv/config";
+import { avg, engagementRate } from "./engagement.js";
 
 const API = "https://www.googleapis.com/youtube/v3";
 const KEY = process.env.YOUTUBE_API_KEY;
@@ -148,14 +149,11 @@ export async function fetchYouTubeChannel(urlOrHandle) {
           likeCount: st.likeCount != null ? Number(st.likeCount) : null,
         };
       });
-      const avg = (a) => (a.length ? Math.round(a.reduce((x, y) => x + y, 0) / a.length) : null);
       profile.avgLikes = avg(likes);
       profile.avgComments = avg(comments);
       profile.engagementSampleSize = items.length;
-      // Rough ER%: avg (likes + comments) per recent video over subscriber base
-      if (profile.avgLikes != null && followers) {
-        profile.engagementRate = Math.round(((profile.avgLikes + (profile.avgComments || 0)) / followers) * 1000) / 10;
-      }
+      // Same ER as the Instagram path — see engagement.js.
+      profile.engagementRate = engagementRate(profile);
     }
   }
 

@@ -17,6 +17,8 @@ import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
+import { startScheduler } from "./scheduler.js";
+import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 const app = express();
 
 app.use(
@@ -64,11 +66,21 @@ function registerCrudRoutes(basePath, Model) {
   });
 
   app.post(basePath, async (req, res) => {
-    const body = req.body;
-    if (!body.id) return res.status(400).json({ error: "id is required" });
-    const doc = await Model.create({ ...body, _id: body.id });
-    const { _id, ...rest } = doc.toObject();
-    res.status(201).json({ id: _id, ...rest });
+    try {
+      const body = req.body;
+      if (!body.id) return res.status(400).json({ error: "id is required" });
+      const doc = await Model.create({ ...body, _id: body.id });
+      const { _id, ...rest } = doc.toObject();
+      res.status(201).json({ id: _id, ...rest });
+    } catch (err) {
+      // This catch is what the whole route was missing. Express 4 does not
+      // catch a rejected promise from an async handler, so a duplicate _id
+      // escaped as an unhandledRejection and Node killed the process — one bad
+      // request took the API down for everyone. 11000 is Mongo's duplicate-key
+      // code; the unique index on _id stays the single source of truth.
+      if (err.code === 11000) return res.status(409).json({ error: "A record with this id already exists." });
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.patch(`${basePath}/:id`, async (req, res) => {
@@ -87,8 +99,12 @@ function registerCrudRoutes(basePath, Model) {
   });
 
   app.delete(`${basePath}/:id`, async (req, res) => {
-    await Model.findByIdAndDelete(req.params.id);
-    res.status(204).end();
+    try {
+      await Model.findByIdAndDelete(req.params.id);
+      res.status(204).end();
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 }
 
@@ -125,13 +141,18 @@ const creatorIdsOf = (creators) =>
 // POST /api/campaigns — create a new campaign
 // Body is the full campaign object (id, name, client, ... as built in onCreate)
 app.post("/api/campaigns", async (req, res) => {
-  const c = req.body;
-  if (!c.id) return res.status(400).json({ error: "id is required" });
-  const creators = await splitCreatorsForStorage(c.creators);
-  const doc = await Campaign.create({ ...c, _id: c.id, creators, creatorIds: creatorIdsOf(creators) });
-  const [hydrated] = await hydrateCampaignCreators([doc.toObject()]);
-  const { _id, ...rest } = hydrated;
-  res.status(201).json({ id: _id, ...rest });
+  try {
+    const c = req.body;
+    if (!c.id) return res.status(400).json({ error: "id is required" });
+    const creators = await splitCreatorsForStorage(c.creators);
+    const doc = await Campaign.create({ ...c, _id: c.id, creators, creatorIds: creatorIdsOf(creators) });
+    const [hydrated] = await hydrateCampaignCreators([doc.toObject()]);
+    const { _id, ...rest } = hydrated;
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "A campaign with this id already exists." });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PATCH /api/campaigns/:id — partial update (brief, creators, stage, etc.)
@@ -162,13 +183,17 @@ app.patch("/api/campaigns/:id", async (req, res) => {
 // with deleted:true so it can be restored by hand, but every list query hides
 // it. The deletion is appended to the campaign's timeline as the audit trail.
 app.delete("/api/campaigns/:id", async (req, res) => {
-  const actor = req.query.actor || "Unknown";
-  const date = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-  await Campaign.findByIdAndUpdate(req.params.id, {
-    $set: { deleted: true, deletedAt: new Date() },
-    $push: { timeline: { date, event: "Campaign deleted", actor } },
-  });
-  res.status(204).end();
+  try {
+    const actor = req.query.actor || "Unknown";
+    const date = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+    await Campaign.findByIdAndUpdate(req.params.id, {
+      $set: { deleted: true, deletedAt: new Date() },
+      $push: { timeline: { date, event: "Campaign deleted", actor } },
+    });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Client Portal (read-only) ────────────────────────────────────────────────
@@ -207,7 +232,11 @@ const CREATOR_PUBLIC = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
   "niche", "state", "languages",
   // campaign-specific workflow the portal renders
-  "status", "concept", "demo", "live", "tracking", "deliverables",
+  // `numDeliverables` is how many posts this creator owes — the brand is
+  // buying it, so it belongs in the client's view of the roster. `live` now
+  // carries a postUrls[] array alongside the postUrl the portal reads today;
+  // both travel under the one key.
+  "status", "concept", "demo", "live", "tracking", "deliverables", "numDeliverables",
 ];
 
 app.get("/api/portal/campaigns", async (req, res) => {
@@ -236,17 +265,26 @@ import Client from "./models/Client.js";
 
 // GET /api/clients — list all clients
 app.get("/api/clients", async (req, res) => {
-  const clients = await Client.find().lean();
-  res.json(clients.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  try {
+    const clients = await Client.find().lean();
+    res.json(clients.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/clients — create a new client
 app.post("/api/clients", async (req, res) => {
-  const c = req.body;
-  if (!c.id) return res.status(400).json({ error: "id is required" });
-  const doc = await Client.create({ ...c, _id: c.id });
-  const { _id, ...rest } = doc.toObject();
-  res.status(201).json({ id: _id, ...rest });
+  try {
+    const c = req.body;
+    if (!c.id) return res.status(400).json({ error: "id is required" });
+    const doc = await Client.create({ ...c, _id: c.id });
+    const { _id, ...rest } = doc.toObject();
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "A client with this id already exists." });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PATCH /api/clients/:id — partial update
@@ -271,10 +309,14 @@ import Finding from "./models/Finding.js";
 
 // GET /api/findings?clientId=fb — list findings, optionally filtered by client
 app.get("/api/findings", async (req, res) => {
-  const q = {};
-  if (req.query.clientId) q.clientId = req.query.clientId;
-  const findings = await Finding.find(q).lean();
-  res.json(findings.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  try {
+    const q = {};
+    if (req.query.clientId) q.clientId = req.query.clientId;
+    const findings = await Finding.find(q).lean();
+    res.json(findings.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PATCH /api/findings/:id — update status (open/develop/task/monitor/ignored)
@@ -296,33 +338,45 @@ app.patch("/api/findings/:id", async (req, res) => {
 // ── Instagram lookup (Add Creator auto-fetch) ───────────────────────────────
 // GET /api/instagram?handle=https://www.instagram.com/someuser/
 app.get("/api/instagram", async (req, res) => {
-  const handle = req.query.handle;
-  if (!handle) return res.status(400).json({ error: "handle query param is required" });
-  const result = await fetchInstagramProfile(handle);
-  if (result.error) return res.status(502).json(result);
-  res.json(result);
+  try {
+    const handle = req.query.handle;
+    if (!handle) return res.status(400).json({ error: "handle query param is required" });
+    const result = await fetchInstagramProfile(handle);
+    if (result.error) return res.status(502).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 // ── YouTube channel lookup (Add Creator auto-fetch, YouTube creators) ───────
 // GET /api/youtube?handle=https://www.youtube.com/@somechannel (or @handle)
 // Same response shape as /api/instagram so the frontend card renders both.
 app.get("/api/youtube", async (req, res) => {
-  const handle = req.query.handle;
-  if (!handle) return res.status(400).json({ error: "handle query param is required" });
-  const result = await fetchYouTubeChannel(handle);
-  if (result.error) return res.status(502).json(result);
-  res.json(result);
+  try {
+    const handle = req.query.handle;
+    if (!handle) return res.status(400).json({ error: "handle query param is required" });
+    const result = await fetchYouTubeChannel(handle);
+    if (result.error) return res.status(502).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 // ── Post metrics (Deliverables tab tracking) ────────────────────────────────
 // GET /api/post-metrics?url=&platform= — dispatches on the link/platform:
 // Instagram via HikerAPI, YouTube via the Data API.
 app.get("/api/post-metrics", async (req, res) => {
-  const { url, platform } = req.query;
-  if (!url) return res.status(400).json({ error: "url query param is required" });
-  const result = await fetchPostMetrics(url, platform);
-  if (result.error) return res.status(502).json(result);
-  res.json(result);
+  try {
+    const { url, platform } = req.query;
+    if (!url) return res.status(400).json({ error: "url query param is required" });
+    const result = await fetchPostMetrics(url, platform);
+    if (result.error) return res.status(502).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 // ── Client Portal Analytics ─────────────────────────────────────────────────
@@ -406,12 +460,26 @@ app.get("/api/portal/analytics", async (req, res) => {
   }
 });
 
+// POST /api/post-metrics/refresh-all — run the nightly job now.
+// Exists so the scheduled job can be verified (and re-run after an outage)
+// without waiting for midnight or redeploying. Returns the same summary the
+// scheduler logs.
+app.post("/api/post-metrics/refresh-all", async (req, res) => {
+  try {
+    res.json(await refreshAllPostMetrics());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 4000;
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
+  // After the DB is up — the jobs query Mongo directly.
+  startScheduler();
 });
 
 

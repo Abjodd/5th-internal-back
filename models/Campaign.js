@@ -25,6 +25,11 @@ const CampaignSchema = new mongoose.Schema(
     budget: Number,
     creatorBudget: Number,
     numReq: Number,
+    // How many posts each creator is briefed for. The PLAN, not a cap — a
+    // creator's own `numDeliverables` (on their creators[] entry) overrides it
+    // for that row, so a roster where one creator does two reels and the rest
+    // do one is expressible without a second campaign.
+    deliverablesPerCreator: Number,
     start: String,
     end: String,
     amId: String,

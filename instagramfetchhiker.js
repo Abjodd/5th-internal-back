@@ -13,6 +13,7 @@
  * }//new file
  */
 import "dotenv/config";
+import { avg, engagementRate } from "./engagement.js";
 
 const BASE_URL = "https://api.hikerapi.com/v1/user/by/username";
 const MEDIAS_URL = "https://api.hikerapi.com/v1/user/medias";
@@ -62,14 +63,10 @@ async function fetchAverageEngagement(userId) {
     return { avgLikes: null, avgComments: null, sampleSize: 0 };
   }
 
-  const likeValues = posts.map((p) => p.like_count).filter((n) => typeof n === "number" && n >= 0);
-  const commentValues = posts.map((p) => p.comment_count).filter((n) => typeof n === "number" && n >= 0);
-
-  const avg = (arr) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null);
-
+  // `avg` filters non-numbers itself — see engagement.js.
   return {
-    avgLikes: avg(likeValues),
-    avgComments: avg(commentValues),
+    avgLikes: avg(posts.map((p) => p.like_count)),
+    avgComments: avg(posts.map((p) => p.comment_count)),
     sampleSize: posts.length,
   };
 }
@@ -132,6 +129,9 @@ export async function fetchInstagramProfile(usernameOrUrl) {
     profilePic: body.profile_pic_url ?? null,
     avgLikes: null,
     avgComments: null,
+    // Same key the YouTube fetcher returns and the Add Creator form reads into
+    // avgER — one response shape for both platforms.
+    engagementRate: null,
     engagementSampleSize: 0,
     fetchedAt: new Date().toISOString(),
   };
@@ -143,6 +143,7 @@ export async function fetchInstagramProfile(usernameOrUrl) {
     profile.avgLikes = engagement.avgLikes;
     profile.avgComments = engagement.avgComments;
     profile.engagementSampleSize = engagement.sampleSize;
+    profile.engagementRate = engagementRate(profile);
   }
 
   return profile;

@@ -8,7 +8,10 @@ import mongoose from "mongoose";
 // Loose schema (strict:false) like the other collections, so the landing page
 // can send extra fields without a schema change. `contact` is the combined
 // "email or phone" field from the form; `goal` is the free-text "what they
-// want from us". `status` drives the founder tab's triage (new → contacted…).
+// want from us". No triage status — every request here is by definition
+// still pending; it's removed entirely once credentials are generated (see
+// routes/clientRequests.js), so there's nothing left to distinguish "new"
+// from "reviewed" from.
 const ClientRequestSchema = new mongoose.Schema(
   {
     _id: { type: String }, // e.g. "cr1" — sequential, assigned server-side
@@ -18,7 +21,6 @@ const ClientRequestSchema = new mongoose.Schema(
     organisation: String,  // brand / company name
     headquarters: String,  // city / base of operations
     goal: String,          // what they want from us (free text)
-    status: { type: String, default: "new" }, // new | reviewed | contacted | archived
   },
   { strict: false, versionKey: false, timestamps: true }
 );
