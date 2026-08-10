@@ -261,6 +261,45 @@ app.get("/api/portal/campaigns", async (req, res) => {
 
 import Client from "./models/Client.js";
 
+// GET /api/portal/client?client=NAME — the brand's own company record, for the
+// portal's Settings → Company panel.
+//
+// An ALLOWLIST for the same reason CREATOR_PUBLIC above is one: Client is
+// `strict: false`, so a denylist would publish every field anyone ever adds.
+// The Client document is mostly *our* working notes ON the brand — the FAAVI
+// score, the audit issues list with its priority scoring, channel benchmarks,
+// competitor mapping, package and open-recommendation counts. None of that is
+// the brand's to read from a self-serve portal; it's what the account team
+// presents, with context, in a review. What's left is the factual company
+// profile the brand told us in the first place, plus who looks after them.
+const CLIENT_PUBLIC = ["name", "website", "consultant"];
+// profile{} is nested and carries the same distinction, so it gets its own list.
+const CLIENT_PROFILE_PUBLIC = [
+  "type", "industry", "subIndustry", "stage", "founded", "employees", "geography",
+];
+
+app.get("/api/portal/client", async (req, res) => {
+  try {
+    const client = req.query.client;
+    if (!client) return res.status(400).json({ error: "client query param is required" });
+    const doc = await Client.findOne({ name: client }).lean();
+    if (!doc) return res.status(404).json({ error: "not found" });
+
+    const pick = (src, keys) =>
+      keys.reduce((out, k) => (src?.[k] == null || src[k] === "" ? out : { ...out, [k]: src[k] }), {});
+
+    res.json({
+      id: doc._id,
+      ...pick(doc, CLIENT_PUBLIC),
+      profile: pick(doc.profile, CLIENT_PROFILE_PUBLIC),
+      products: Array.isArray(doc.products) ? doc.products : [],
+      createdAt: doc.createdAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Clients (Company Overview) ─────────────────────────────────────────────
 
 // GET /api/clients — list all clients
