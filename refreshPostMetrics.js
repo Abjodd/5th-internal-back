@@ -15,12 +15,23 @@
 import Campaign from "./models/Campaign.js";
 import { fetchPostMetrics } from "./postMetrics.js";
 
-// Only campaigns with work in flight. Mirrors the frontend's 7-stage pipeline
-// (src/lib/campaign.js) plus the legacy ids that map into execution, so this
-// keeps working on documents that predate the stage collapse and haven't been
-// re-saved yet.
+// Only campaigns with work in flight. Mirrors the frontend's finance track
+// (src/lib/campaign.js) plus every retired id that used to mean "delivering",
+// so this keeps working on documents that predate a stage change and haven't
+// been re-saved yet — nothing migrates the collection, it self-heals on save.
+//
+// The set is deliberately WIDER than "the campaign is live" since the pipeline
+// forked. Delivery is now its own derived track, so a campaign's stored stage
+// no longer says whether creators are posting: a campaign sitting at
+// `team_assigned` because the client PO is slow can still have every creator
+// live. Gating on the old two stages would have quietly stopped refreshing
+// exactly those campaigns. `draft`/`brief_locked` stay out — no roster can
+// exist yet — and `payment_done` stays out because a settled campaign is
+// signed off and its numbers should stop moving.
 const ACTIVE_STAGES = [
-  "execution", "reporting",
+  "team_assigned", "po_raised", "advance_received", "invoice_raised",
+  // Retired ids, still on documents that haven't been re-saved.
+  "execution", "reporting", "po", "advance",
   "brief_sent", "concept_submitted", "concept_approved", "production",
   "video_submitted", "internal_review", "client_approved", "live", "creator_paid",
 ];
