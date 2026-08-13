@@ -20,6 +20,17 @@ const CampaignSchema = new mongoose.Schema(
     brandId: String, // FK to Client._id — "client" stays as a denormalized display name
     service: String,
     region: String,
+    // The FINANCE track only:
+    //   draft → brief_locked → team_assigned → po_raised → advance_received
+    //         → invoice_raised → payment_done
+    // Deliberately an unconstrained String. Retired ids from two earlier
+    // vocabularies are still on documents here and are remapped on read by the
+    // frontend's normStage() (src/lib/campaign.js), which self-heals each
+    // document on its next save — an enum would reject them on write instead.
+    //
+    // There is no execution stage stored anywhere. Delivery is derived from
+    // creators[] on every read (executionStageOf), so a campaign can never
+    // hold a delivery stage that disagrees with its own roster.
     stage: String,
     progress: Number,
     budget: Number,
