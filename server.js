@@ -19,6 +19,8 @@ import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
+import Client from "./models/Client.js";
+import Finding from "./models/Finding.js";
 const app = express();
 
 app.use(
@@ -259,8 +261,6 @@ app.get("/api/portal/campaigns", async (req, res) => {
   }
 });
 
-import Client from "./models/Client.js";
-
 // GET /api/portal/client?client=NAME — the brand's own company record, for the
 // portal's Settings → Company panel.
 //
@@ -341,8 +341,6 @@ app.patch("/api/clients/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-import Finding from "./models/Finding.js";
 
 // ── Findings (Audit Centre) ──────────────────────────────────────────────────
 
@@ -520,14 +518,3 @@ connectDB().then(() => {
   // After the DB is up — the jobs query Mongo directly.
   startScheduler();
 });
-
-
-// const cors = require("cors");
-
-// app.use(cors({
-//   origin: [
-//     "http://localhost:5173",
-//     "https://your-frontend.vercel.app"
-//   ],
-//   credentials: true
-// }));

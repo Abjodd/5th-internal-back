@@ -32,25 +32,36 @@ const omit = (obj, keys) => Object.fromEntries(Object.entries(obj || {}).filter(
 // builds/edits them as one flat shape), upsert each one's profile fields into
 // the creators directory and return the slim array that actually gets stored
 // on the campaign document.
+//
+// Batched rather than one findById + updateOne per creator: a 10-creator
+// roster used to mean up to 20 sequential round trips to Mongo on every save
+// (drag a slider on the Creators tab, and every locked creator's profile got
+// refetched one at a time). One find({_id:{$in}}) plus one bulkWrite covers
+// the whole roster in two round trips regardless of size.
 export async function splitCreatorsForStorage(creators) {
-  const slim = [];
-  for (const cr of creators || []) {
-    const key = keyOf(cr);
-    if (key) {
-      const profile = pick(cr, PROFILE_FIELDS);
-      if (Object.keys(profile).length) {
-        const { personalDetails, ...rest } = profile;
-        const set = { ...rest };
-        if (personalDetails) {
-          const existing = await Creator.findById(key).select("personalDetails").lean();
-          set.personalDetails = { ...(existing?.personalDetails || {}), ...personalDetails };
-        }
-        await Creator.updateOne({ _id: key }, { $set: set }, { upsert: true });
-      }
-    }
-    slim.push({ ...omit(cr, PROFILE_FIELDS), creatorId: key || cr.creatorId || null });
+  const list = creators || [];
+  const keyed = list.map((cr) => ({ cr, key: keyOf(cr) }));
+
+  const withDetails = keyed.filter(({ cr, key }) => key && cr.personalDetails);
+  const existingByKey = withDetails.length
+    ? new Map((await Creator.find({ _id: { $in: withDetails.map((k) => k.key) } })
+        .select("personalDetails").lean())
+        .map((d) => [d._id, d.personalDetails || {}]))
+    : new Map();
+
+  const ops = [];
+  for (const { cr, key } of keyed) {
+    if (!key) continue;
+    const profile = pick(cr, PROFILE_FIELDS);
+    if (!Object.keys(profile).length) continue;
+    const { personalDetails, ...rest } = profile;
+    const set = { ...rest };
+    if (personalDetails) set.personalDetails = { ...(existingByKey.get(key) || {}), ...personalDetails };
+    ops.push({ updateOne: { filter: { _id: key }, update: { $set: set }, upsert: true } });
   }
-  return slim;
+  if (ops.length) await Creator.bulkWrite(ops);
+
+  return keyed.map(({ cr, key }) => ({ ...omit(cr, PROFILE_FIELDS), creatorId: key || cr.creatorId || null }));
 }
 
 // Reverse of the split above — merges each campaign's creator entries with
