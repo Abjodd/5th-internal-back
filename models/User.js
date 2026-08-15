@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { AVATAR_FIELDS } from "../avatarStore.js";
 
 // Internal platform user (founder, pcm, cm, am, ea, accounts_*).
 // Passwords are never stored — only `hashKey` (sha256 of the password, see
@@ -20,18 +21,11 @@ const UserSchema = new mongoose.Schema(
     // client-side before upload (~20-30KB), which is small enough to live inline
     // and avoids a second round trip on every avatar render.
     //
-    // NEVER returned by the list routes — see pub()/AVATAR_OMIT in routes/auth.js.
+    // NEVER returned by the list routes — see pub()/OMIT_AVATAR in routes/auth.js.
     // A 30KB blob per row would add ~600KB to a 20-user list call that is fetched
     // on the Auth page, the Summary and the app shell. It is served instead from
     // GET …/:id/avatar, which is cacheable and only fetched for rows on screen.
-    avatarImage: {
-      data: Buffer,
-      contentType: String,
-    },
-    // Bumped on every avatar write. Callers put it in the avatar URL's query
-    // string so a replaced photo busts the browser cache immediately, while an
-    // unchanged one keeps being served from it.
-    avatarUpdatedAt: Date,
+    ...AVATAR_FIELDS,
     hashKey: String,              // sha256(password) — never the plaintext
     deleted: Boolean,
     deletedAt: Date,

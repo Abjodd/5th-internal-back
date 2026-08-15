@@ -19,6 +19,7 @@ const ClientSchema = new mongoose.Schema(
     // strict:false means the field still stores, reads and round-trips through
     // save() untouched — it just has no schema entry. Read it with doc.get("init")
     // rather than doc.init on a hydrated document.
+
     // The brand's logo, same contract as a user's profile photo: downscaled
     // client-side, stored inline, omitted from list responses and served from
     // GET /api/clients/:id/avatar. See avatarStore.js.

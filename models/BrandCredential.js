@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { AVATAR_FIELDS } from "../avatarStore.js";
 
 // External (client-portal) login credential, mapped to a brand via brandId
 // (= Client._id, e.g. "fb"). Same hashKey convention as models/User.js —
@@ -16,11 +17,7 @@ const BrandCredentialSchema = new mongoose.Schema(
     // Optional profile photo. Same contract as models/User.js: downscaled and
     // re-encoded client-side, stored inline on the document, and deliberately
     // omitted from every list response — served from GET …/:id/avatar instead.
-    avatarImage: {
-      data: Buffer,
-      contentType: String,
-    },
-    avatarUpdatedAt: Date,
+    ...AVATAR_FIELDS,
     hashKey: String,              // sha256(password)
     deleted: Boolean,
     deletedAt: Date,

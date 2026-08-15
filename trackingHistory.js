@@ -53,13 +53,37 @@ export function snapshotOf(tracking, at = new Date()) {
 
 const sameMetrics = (a, b) => METRICS.every((k) => numOrNull(a?.[k]) === numOrNull(b?.[k]));
 
+/** A Date from an ISO string, or null. Guards against `lastFetched`, which is
+ *  a display string ("12:06 am") carrying no date and must never seed a point. */
+function isoDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d) ? null : d;
+}
+
 /**
  * The history array a creator should carry after `tracking` is written.
  * Returns the existing array unchanged when the new reading earns no point,
  * so callers can cheaply detect "nothing to store".
+ *
+ * `prevTracking` is the reading being REPLACED. When a creator has no history
+ * yet but does have a previous reading with a real timestamp, that reading
+ * becomes the first point. Without this the already-measured numbers are
+ * thrown away and the series restarts from the next refresh — so a chart that
+ * needs two points to draw would stay empty for two full refresh cycles even
+ * though a perfectly good earlier reading was sitting on the document. Seeding
+ * is only ever done from `lastAutoRefresh` (an ISO timestamp); a reading we
+ * cannot date is skipped rather than given an invented one.
  */
-export function withHistory(prevHistory, tracking, at = new Date()) {
-  const history = Array.isArray(prevHistory) ? prevHistory : [];
+export function withHistory(prevHistory, tracking, at = new Date(), prevTracking = null) {
+  let history = Array.isArray(prevHistory) ? prevHistory : [];
+
+  if (!history.length && prevTracking && !METRICS.every((k) => prevTracking[k] == null)) {
+    const seedAt = isoDate(prevTracking.lastAutoRefresh);
+    // Strictly earlier than the reading being stored — a seed at or after `at`
+    // would put the series out of order.
+    if (seedAt && seedAt < at) history = [snapshotOf(prevTracking, seedAt)];
+  }
   // Nothing measured yet — recording a row of nulls would put a false zero at
   // the start of every chart.
   if (!tracking || METRICS.every((k) => tracking[k] == null)) return history;
@@ -97,7 +121,7 @@ export function carryTrackingHistory(prevCreators = [], nextCreators = [], at = 
   return nextCreators.map((cr) => {
     if (!cr?.tracking) return cr;
     const prior = prevByKey.get(keyOf(cr));
-    const history = withHistory(prior?.tracking?.history, cr.tracking, at);
+    const history = withHistory(prior?.tracking?.history, cr.tracking, at, prior?.tracking);
     return { ...cr, tracking: { ...cr.tracking, history } };
   });
 }

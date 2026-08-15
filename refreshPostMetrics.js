@@ -100,8 +100,14 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
         lastAutoRefresh: new Date().toISOString(),
       };
       // Recorded before the overwrite, so each night's reading survives as a
-      // point on the growth chart instead of replacing the only copy.
-      cr.tracking = { ...next, history: withHistory(cr.tracking?.history, next) };
+      // point on the growth chart instead of replacing the only copy. The
+      // outgoing tracking is passed too: on a creator that has no series yet it
+      // seeds the first point, so the chart has something to draw one refresh
+      // sooner than if the already-measured reading were simply discarded.
+      cr.tracking = {
+        ...next,
+        history: withHistory(cr.tracking?.history, next, new Date(), cr.tracking),
+      };
       changed = true;
     }
 
