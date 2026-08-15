@@ -14,6 +14,7 @@
  */
 import Campaign from "./models/Campaign.js";
 import { fetchPostMetrics } from "./postMetrics.js";
+import { withHistory } from "./trackingHistory.js";
 
 // Only campaigns with work in flight. Mirrors the frontend's finance track
 // (src/lib/campaign.js) plus every retired id that used to mean "delivering",
@@ -90,13 +91,22 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
         ? results.reduce((s, m) => s + (m[k] || 0), 0)
         : null);
 
-      cr.tracking = {
+      const next = {
         ...(cr.tracking || {}),
         views: sum("views"), likes: sum("likes"),
         comments: sum("comments"), forwards: sum("forwards"),
         postsCounted: results.length,
         lastFetched: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
         lastAutoRefresh: new Date().toISOString(),
+      };
+      // Recorded before the overwrite, so each night's reading survives as a
+      // point on the growth chart instead of replacing the only copy. The
+      // outgoing tracking is passed too: on a creator that has no series yet it
+      // seeds the first point, so the chart has something to draw one refresh
+      // sooner than if the already-measured reading were simply discarded.
+      cr.tracking = {
+        ...next,
+        history: withHistory(cr.tracking?.history, next, new Date(), cr.tracking),
       };
       changed = true;
     }

@@ -7,6 +7,7 @@ import invoicePdfRoutes from "./routes/invoicePdf.js";
 import authRoutes from "./routes/auth.js";
 import creatorRoutes from "./routes/creators.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
+import { carryTrackingHistory } from "./trackingHistory.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
 import Expense from "./models/Expense.js";
@@ -19,6 +20,11 @@ import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
+import Client from "./models/Client.js";
+import Finding from "./models/Finding.js";
+// Brand logos ride the same machinery as user profile photos — see avatarStore.js
+// for why images live inline on the document and are served from their own route.
+import { withAvatar, serveAvatar, OMIT_AVATAR } from "./avatarStore.js";
 const app = express();
 
 app.use(
@@ -162,6 +168,12 @@ app.patch("/api/campaigns/:id", async (req, res) => {
   try {
     const patch = { ...req.body };
     if ("creators" in patch) {
+      // The browser sends creators[] without tracking.history — it has no
+      // reason to carry it — so writing the request straight through would
+      // wipe the series on every save. Merge it back from the stored document
+      // first, extending it with whatever this request reports.
+      const prior = await Campaign.findById(req.params.id, { creators: 1 }).lean();
+      patch.creators = carryTrackingHistory(prior?.creators || [], patch.creators);
       patch.creators = await splitCreatorsForStorage(patch.creators);
       patch.creatorIds = creatorIdsOf(patch.creators);
     }
@@ -259,8 +271,6 @@ app.get("/api/portal/campaigns", async (req, res) => {
   }
 });
 
-import Client from "./models/Client.js";
-
 // GET /api/portal/client?client=NAME — the brand's own company record, for the
 // portal's Settings → Company panel.
 //
@@ -282,7 +292,7 @@ app.get("/api/portal/client", async (req, res) => {
   try {
     const client = req.query.client;
     if (!client) return res.status(400).json({ error: "client query param is required" });
-    const doc = await Client.findOne({ name: client }).lean();
+    const doc = await Client.findOne({ name: client }, OMIT_AVATAR).lean();
     if (!doc) return res.status(404).json({ error: "not found" });
 
     const pick = (src, keys) =>
@@ -302,11 +312,25 @@ app.get("/api/portal/client", async (req, res) => {
 
 // ── Clients (Company Overview) ─────────────────────────────────────────────
 
+// Shared shaping for every client response. `avatarImage` is dropped for weight,
+// not secrecy — the bytes are served from /api/clients/:id/avatar instead, and
+// `hasAvatar` is derived from `avatarUpdatedAt` so it stays correct even when
+// the query projected the bytes away. Mirrors pub() in routes/auth.js.
+const clientPub = ({ _id, avatarImage, avatarUpdatedAt, ...rest }) => ({
+  id: _id,
+  hasAvatar: !!avatarUpdatedAt,
+  avatarUpdatedAt: avatarUpdatedAt || null,
+  ...rest,
+});
+
 // GET /api/clients — list all clients
 app.get("/api/clients", async (req, res) => {
   try {
-    const clients = await Client.find().lean();
-    res.json(clients.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+    // Logo bytes projected away at the query: this list is fetched by the app
+    // shell's brand filter on EVERY page load, so it is the single hottest
+    // endpoint in the product and has no business carrying images.
+    const clients = await Client.find({}, OMIT_AVATAR).lean();
+    res.json(clients.map(clientPub));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -317,9 +341,11 @@ app.post("/api/clients", async (req, res) => {
   try {
     const c = req.body;
     if (!c.id) return res.status(400).json({ error: "id is required" });
-    const doc = await Client.create({ ...c, _id: c.id });
-    const { _id, ...rest } = doc.toObject();
-    res.status(201).json({ id: _id, ...rest });
+    const body = { ...c, _id: c.id };
+    try { withAvatar(body, c); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    const doc = await Client.create(body);
+    res.status(201).json(clientPub(doc.toObject()));
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ error: "A client with this id already exists." });
     res.status(500).json({ error: err.message });
@@ -329,20 +355,27 @@ app.post("/api/clients", async (req, res) => {
 // PATCH /api/clients/:id — partial update
 app.patch("/api/clients/:id", async (req, res) => {
   try {
+    const patch = { ...req.body };
+    // Absent = logo untouched; null = removed; data URI = replaced. An edit to
+    // any other field must not disturb the logo.
+    try { withAvatar(patch, req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
     const updated = await Client.findByIdAndUpdate(
       req.params.id,
-      { $set: req.body },
-      { new: true }
+      { $set: patch },
+      { new: true, projection: OMIT_AVATAR }
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
-    const { _id, ...rest } = updated;
-    res.json({ id: _id, ...rest });
+    res.json(clientPub(updated));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-import Finding from "./models/Finding.js";
+// GET /api/clients/:id/avatar — the brand's logo bytes, cached immutably and
+// read through ?v=<avatarUpdatedAt>. Registered before nothing else matches
+// /api/clients/:id, so no ordering hazard.
+app.get("/api/clients/:id/avatar", serveAvatar(Client));
 
 // ── Findings (Audit Centre) ──────────────────────────────────────────────────
 
@@ -418,6 +451,21 @@ app.get("/api/post-metrics", async (req, res) => {
   }
 });
 
+// Follower counts are stored compact and inconsistently — the creators
+// directory keeps whatever was typed or scraped ("820K", "1.2M", "213001",
+// 11606, ""), so this normalizes all of it to a number. Anything it can't
+// parse is 0 rather than NaN, which would poison every sum downstream.
+function parseFollowers(raw) {
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : 0;
+  if (typeof raw !== "string") return 0;
+  const up = raw.trim().toUpperCase().replace(/,/g, "");
+  const mp = up.match(/^([\d.]+)\s*([KM])?$/);
+  if (!mp) return 0;
+  const n = parseFloat(mp[1]);
+  if (!Number.isFinite(n)) return 0;
+  return n * (mp[2] === "M" ? 1e6 : mp[2] === "K" ? 1e3 : 1);
+}
+
 // ── Client Portal Analytics ─────────────────────────────────────────────────
 // GET /api/portal/analytics?client=NAME&from=ISO&to=ISO
 // Returns one dated event per campaign in the period (spend/reach/engagement
@@ -426,10 +474,35 @@ app.get("/api/post-metrics", async (req, res) => {
 // 5th-avenue-client-front src/lib/dates.js bucketSeries), so switching
 // granularity never needs a refetch.
 // Reach  = sum of creator followers (audience reach potential per campaign)
-// Engagements = reach × avgER across creators
-// Impressions = reach × 0.12 (estimated: 12% of follower base sees each post)
-// Clicks = engagements × 0.08 (estimated: 8% click-through on engaged audience)
-// All estimates are clearly labelled in the API response.
+// Impressions = measured post views where we have them, else reach × 0.12
+// Engagements = measured likes+comments+forwards where we have them, else reach × avgER
+// Clicks = engagements × 0.08 (always an estimate — nothing tracks clicks)
+// Measured vs estimated is reported per event so the portal can say which it is.
+//
+// Two bugs lived here, and both rendered the portal's headline numbers as 0
+// while spend showed correctly — the shape a reader is most likely to read as
+// "the campaign did nothing" rather than "the page is broken".
+//
+//  1. This read cr.followers / cr.avgER straight off the campaign document.
+//     Those fields have not lived there since creator profiles moved into the
+//     `creators` collection — they belong to the directory now and come back
+//     only via hydrateCampaignCreators(), which every other read path already
+//     calls (see /api/campaigns and /api/portal/campaigns). This endpoint was
+//     written before the split and never migrated, so followers was undefined
+//     for every creator, reach summed to 0, and impressions/engagements/clicks
+//     -- all derived from reach -- collapsed with it.
+//
+//  2. Even with reach restored, every number here was still an estimate off
+//     the follower count while cr.tracking held real measured view/like counts
+//     fetched from the post itself. The portal's own footnote promised "real
+//     tracking data updates when 5th Avenue refreshes post metrics"; nothing
+//     ever read it. Measured data now wins per creator, falling back to the
+//     estimate only for creators whose posts have not been fetched yet.
+//
+// NOTE: impressions can legitimately exceed reach once measured data is in
+// play. Views count repeat views and non-followers (reels travel to explore),
+// whereas reach is only the creator's own follower base. That is virality, not
+// a bad number — the funnel in the portal is built to show it as a rise.
 app.get("/api/portal/analytics", async (req, res) => {
   try {
     const client = req.query.client;
@@ -439,6 +512,9 @@ app.get("/api/portal/analytics", async (req, res) => {
     const to   = req.query.to   ? new Date(req.query.to)   : new Date();
 
     const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
+    // Rejoins each roster entry with its profile in the creators directory.
+    // Without this, followers/avgER are undefined and every metric below is 0.
+    await hydrateCampaignCreators(campaigns);
 
     // Campaign.start/end are stored as ISO ("YYYY-MM-DD"). Legacy rows that
     // predated this (month-first "Mar 1", day-first "3 Jul") were normalized
@@ -457,30 +533,53 @@ app.get("/api/portal/analytics", async (req, res) => {
       const startDate = parseISO(c.start);
       if (!startDate || startDate < from || startDate > to) return;
 
-      // Compute aggregate reach + ER across creators
+      // Per creator: use what was actually measured on their post, and fall
+      // back to the follower-based estimate only for creators whose posts
+      // haven't been fetched yet. Done per creator rather than per campaign so
+      // a roster that is half-tracked reports the real numbers for the half we
+      // have instead of discarding them.
       const creators = c.creators || [];
-      let totalFollowers = 0, weightedER = 0, erCount = 0;
+      let reach = 0, impressions = 0, engagements = 0;
+      let measuredCreators = 0;
+
       creators.forEach(cr => {
-        const raw = cr.followers;
-        let f = typeof raw === "number" ? raw : 0;
-        if (typeof raw === "string") {
-          const up = raw.trim().toUpperCase().replace(/,/g,"");
-          const mp = up.match(/^([\d.]+)\s*([KM])?$/);
-          if (mp) f = parseFloat(mp[1]) * (mp[2]==="M" ? 1e6 : mp[2]==="K" ? 1e3 : 1);
+        const f = parseFollowers(cr.followers) || parseFollowers(cr.igFetched?.followers);
+        reach += f;
+
+        // Directory ER first; otherwise derive it from the IG profile snapshot
+        // stored on the campaign (avgLikes+avgComments over followers), which
+        // is the only ER available for creators added by handle lookup.
+        let er = Number(cr.avgER) > 0 ? Number(cr.avgER) : 0;
+        if (!er && cr.igFetched && f > 0) {
+          const likes = Number(cr.igFetched.avgLikes) || 0;
+          const comments = Number(cr.igFetched.avgComments) || 0;
+          if (likes || comments) er = ((likes + comments) / f) * 100;
         }
-        totalFollowers += f;
-        if (cr.avgER > 0) { weightedER += cr.avgER * f; erCount += f; }
+
+        const t = cr.tracking || {};
+        const hasMeasured = t.views != null || t.likes != null;
+        if (hasMeasured) {
+          measuredCreators++;
+          impressions += Number(t.views) || 0;
+          engagements += (Number(t.likes) || 0) + (Number(t.comments) || 0) + (Number(t.forwards) || 0);
+        } else {
+          impressions += Math.round(f * 0.12);
+          engagements += Math.round(f * (er / 100));
+        }
       });
-      const avgER = erCount > 0 ? weightedER / erCount : 0;
-      const reach = totalFollowers;
-      const engagements = Math.round(reach * (avgER / 100));
-      const impressions = Math.round(reach * 0.12);
-      const clicks      = Math.round(engagements * 0.08);
-      const spend       = Number(c.budget) || 0;
+
+      // No click tracking exists anywhere in the pipeline, so this stays an
+      // estimate even when everything above it was measured.
+      const clicks = Math.round(engagements * 0.08);
+      const spend  = Number(c.budget) || 0;
 
       events.push({
         date: c.start, campaign: c.name,
         spend, reach, engagements, impressions, clicks,
+        // Lets the portal label the campaign honestly rather than presenting
+        // an estimate and a measurement in the same typeface.
+        measured: measuredCreators > 0,
+        measuredCreators, totalCreators: creators.length,
       });
 
       // Spend split by service — same period filter as the events above, so
@@ -492,7 +591,7 @@ app.get("/api/portal/analytics", async (req, res) => {
     res.json({
       events,
       spendByService,
-      note: "reach=followers sum; engagements=reach×avgER; impressions≈reach×0.12; clicks≈engagements×0.08",
+      note: "reach=followers sum; impressions/engagements measured from post metrics where available, else impressions≈reach×0.12 and engagements≈reach×avgER; clicks≈engagements×0.08 (always estimated)",
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -520,14 +619,3 @@ connectDB().then(() => {
   // After the DB is up — the jobs query Mongo directly.
   startScheduler();
 });
-
-
-// const cors = require("cors");
-
-// app.use(cors({
-//   origin: [
-//     "http://localhost:5173",
-//     "https://your-frontend.vercel.app"
-//   ],
-//   credentials: true
-// }));

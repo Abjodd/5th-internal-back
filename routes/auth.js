@@ -11,6 +11,9 @@ import crypto from "node:crypto";
 import User from "../models/User.js";
 import BrandCredential from "../models/BrandCredential.js";
 import Client from "../models/Client.js";
+// Profile photos: parsing, the 2MB cap and the serve route are shared with the
+// clients collection (brand logos) — see avatarStore.js.
+import { withAvatar, serveAvatar, OMIT_AVATAR } from "../avatarStore.js";
 
 const router = Router();
 
@@ -38,9 +41,23 @@ export function decryptPassword(passKey) {
 }
 
 // Both secrets stay server-side: no response ever includes hashKey/passKey.
+// `avatarImage` is stripped for a different reason — not secrecy but weight; it
+// is served from …/:id/avatar instead (see models/User.js).
+//
+// `hasAvatar` is derived from `avatarUpdatedAt`, NOT from the bytes, precisely
+// so it survives the list route projecting the bytes away: a flag computed from
+// a field the query excluded would read false for every user who has a photo.
+// The two are written and cleared together in withAvatar(), so the timestamp is
+// an exact witness for "there is an image to fetch".
+//
 // pub() keeps the soft-delete bookkeeping (the Auth page's "show removed"
 // toggle renders it); safe() additionally drops it for login responses.
-const pub  = ({ _id, hashKey, passKey, ...rest }) => ({ id: _id, ...rest });
+const pub  = ({ _id, hashKey, passKey, avatarImage, avatarUpdatedAt, ...rest }) => ({
+  id: _id,
+  hasAvatar: !!avatarUpdatedAt,
+  avatarUpdatedAt: avatarUpdatedAt || null,
+  ...rest,
+});
 const safe = (doc) => { const { deleted, deletedAt, ...rest } = pub(doc); return rest; };
 
 // Sequential ids in the seed format — "u10" after "u9", "bc3" after "bc2",
@@ -67,10 +84,14 @@ function loginHandler(Model, extra = () => ({}), unlinkedError) {
       const { email, password } = req.body || {};
       if (!email || !password)
         return res.status(400).json({ error: "email and password are required" });
+      // Photo bytes projected away: the login response is the session payload
+      // both frontends hold in memory and mirror to sessionStorage, and a 30KB
+      // base64 blob has no business in there. `hasAvatar`/`avatarUpdatedAt`
+      // survive, which is all the shell needs to build the avatar URL.
       const doc = await Model.findOne({
         username: String(email).toLowerCase().trim(),
         deleted: { $ne: true },
-      }).lean();
+      }, OMIT_AVATAR).lean();
       if (!doc || doc.hashKey !== hashPassword(password))
         return res.status(401).json({ error: "Invalid email or password." });
       const extraFields = await extra(doc);
@@ -93,7 +114,9 @@ router.post("/api/auth/login", loginHandler(User));
 router.post("/api/auth/portal-login", loginHandler(
   BrandCredential,
   async (doc) => {
-    const client = await Client.findById(doc.brandId).lean();
+    // Only the name is read, so the logo bytes are projected away rather than
+    // pulled across on every portal sign-in.
+    const client = await Client.findById(doc.brandId, { name: 1 }).lean();
     return client && { brandId: doc.brandId, clientName: client.name };
   },
   "This login isn't linked to an active client yet."
@@ -111,7 +134,11 @@ function registerAuthCrudRoutes(basePath, Model) {
       // exist in the DB; new removals are hard deletes (see DELETE below).
       const q = { deleted: { $ne: true } };
       if (req.query.brandId) q.brandId = req.query.brandId;
-      const docs = await Model.find(q).lean();
+      // Photo bytes are projected away at the query, not just dropped by pub():
+      // filtering them in JS would still pull every blob out of Mongo and across
+      // the wire into this process. `hasAvatar` is derived from avatarUpdatedAt
+      // so it stays accurate without them.
+      const docs = await Model.find(q, OMIT_AVATAR).lean();
       res.json(docs.map(pub));
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -124,6 +151,12 @@ function registerAuthCrudRoutes(basePath, Model) {
       if (!body.username) return res.status(400).json({ error: "username is required" });
       if (!password) return res.status(400).json({ error: "password is required" });
       body.username = String(body.username).toLowerCase().trim();
+      // Rejected as a 400 with the parser's own message ("must be 2MB or
+      // smaller", "must be a PNG, JPEG or WebP image") rather than falling into
+      // the generic 500 below — the upload is the one field here a user can get
+      // wrong in a way they can fix themselves.
+      try { withAvatar(body, req.body); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
       const clash = await Model.findOne({ username: body.username, deleted: { $ne: true } }).lean();
       if (clash) return res.status(409).json({ error: "username already exists" });
       const id = body.id || await nextInSequence(Model, ID_PREFIX.get(Model) || "");
@@ -148,10 +181,15 @@ function registerAuthCrudRoutes(basePath, Model) {
         patch.hashKey = hashPassword(password);
         patch.passKey = encryptPassword(password);
       }
+      // Absent = photo untouched; null = photo removed; data URI = replaced.
+      // The three-way distinction matters because this is a PATCH: an edit that
+      // doesn't mention the avatar must not clear it.
+      try { withAvatar(patch, req.body); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
       const updated = await Model.findByIdAndUpdate(
         req.params.id,
         { $set: patch },
-        { new: true }
+        { new: true, projection: OMIT_AVATAR }
       ).lean();
       if (!updated) return res.status(404).json({ error: "not found" });
       res.json(pub(updated));
@@ -166,7 +204,7 @@ function registerAuthCrudRoutes(basePath, Model) {
   // every other route here — see the auth gap in the codebase docs.)
   router.get(`${basePath}/:id/password`, async (req, res) => {
     try {
-      const doc = await Model.findById(req.params.id).lean();
+      const doc = await Model.findById(req.params.id, { passKey: 1 }).lean();
       if (!doc) return res.status(404).json({ error: "not found" });
       if (!doc.passKey)
         return res.status(404).json({ error: "No recoverable password stored — set a new password to enable reveal." });
@@ -175,6 +213,19 @@ function registerAuthCrudRoutes(basePath, Model) {
       res.status(500).json({ error: err.message });
     }
   });
+
+  // GET …/:id/avatar — the profile photo bytes.
+  //
+  // A route rather than an inlined field so the image is fetched once per
+  // browser and then cached: avatars render as icons in a dozen places (the app
+  // shell's user chip, the Auth table, campaign rosters, the Summary's team
+  // grid), and inlining them would re-send the same 30KB on every list call.
+  //
+  // Cached immutably for a year and read through `?v=<avatarUpdatedAt>` — the
+  // URL changes the instant the photo does, so a stale image is impossible
+  // despite the long max-age. Requests without the query param are still
+  // correct, just re-fetched more often.
+  router.get(`${basePath}/:id/avatar`, serveAvatar(Model));
 
   // Hard delete — the doc is removed from Mongo entirely so the id sequence
   // (u1, u2, … via nextInSequence) stays consistent and freed ids are reused.
