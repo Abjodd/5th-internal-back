@@ -15,22 +15,12 @@ import CreatorRequest from "../models/CreatorRequest.js";
 import Creator from "../models/Creator.js";
 import { keyOf } from "../creatorSync.js";
 import { sendCreatorApplicationEmail } from "../mailer.js";
+import { pub, nextSeqId } from "./requestInbox.js";
 
 const router = Router();
 
-// Next sequential id ("crq1", "crq2", …) — same scheme the client-request and
-// auth routes use. Assigned server-side so the landing page never has to know
-// our id format.
-async function nextId() {
-  const docs = await CreatorRequest.find({}, { _id: 1 }).lean();
-  const max = docs.reduce((m, d) => {
-    const match = /^crq(\d+)$/.exec(d._id || "");
-    return match ? Math.max(m, parseInt(match[1], 10)) : m;
-  }, 0);
-  return `crq${max + 1}`;
-}
-
-const pub = ({ _id, ...rest }) => ({ id: _id, ...rest });
+// Sequential ids: "crq1", "crq2", … — see requestInbox.js.
+const nextId = () => nextSeqId(CreatorRequest, "crq");
 
 // Accept either an array or a comma-separated string for the multi-select
 // fields, so the landing page can post whichever shape is convenient.
@@ -97,6 +87,20 @@ router.patch("/api/creator-requests/:id", async (req, res) => {
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
     res.json(pub(updated));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/creator-requests/:id — founder tab, dismissing an application
+// that isn't going anywhere. Promoting one already removes it (see below);
+// this is the other ending, for applications that are never going to be
+// promoted and would otherwise sit in the inbox forever.
+router.delete("/api/creator-requests/:id", async (req, res) => {
+  try {
+    const deleted = await CreatorRequest.findByIdAndDelete(req.params.id).lean();
+    if (!deleted) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

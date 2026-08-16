@@ -10,6 +10,7 @@ import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creat
 import { carryTrackingHistory } from "./trackingHistory.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
+import careerRequestRoutes from "./routes/careerRequests.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -25,6 +26,7 @@ import Finding from "./models/Finding.js";
 // Brand logos ride the same machinery as user profile photos — see avatarStore.js
 // for why images live inline on the document and are served from their own route.
 import { withAvatar, serveAvatar, OMIT_AVATAR } from "./avatarStore.js";
+import { suggestLogo } from "./faviconFetch.js";
 const app = express();
 
 app.use(
@@ -55,6 +57,7 @@ app.use(authRoutes);
 app.use(creatorRoutes);
 app.use(clientRequestRoutes);
 app.use(creatorRequestRoutes);
+app.use(careerRequestRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
@@ -301,6 +304,11 @@ app.get("/api/portal/client", async (req, res) => {
     res.json({
       id: doc._id,
       ...pick(doc, CLIENT_PUBLIC),
+      // The brand's own logo — its identity, and the fallback picture for
+      // members who haven't set one. Bytes come from /api/clients/:id/avatar;
+      // this is just the witness, same contract as clientPub().
+      hasAvatar: !!doc.avatarUpdatedAt,
+      avatarUpdatedAt: doc.avatarUpdatedAt || null,
       profile: pick(doc.profile, CLIENT_PROFILE_PUBLIC),
       products: Array.isArray(doc.products) ? doc.products : [],
       createdAt: doc.createdAt || null,
@@ -376,6 +384,24 @@ app.patch("/api/clients/:id", async (req, res) => {
 // read through ?v=<avatarUpdatedAt>. Registered before nothing else matches
 // /api/clients/:id, so no ordering hazard.
 app.get("/api/clients/:id/avatar", serveAvatar(Client));
+
+// GET /api/logo-suggestion?website=nike.com — the brand's own site icon, as a
+// data URI for the "use this as the logo?" confirmation.
+//
+// Read-only and not client-scoped: the founder can preview a logo for a brand
+// that has no website saved yet (none of them do), and accepting it is a normal
+// PATCH /api/clients/:id like any other logo change. See faviconFetch.js.
+app.get("/api/logo-suggestion", async (req, res) => {
+  try {
+    const result = await suggestLogo(req.query.website);
+    // 422, not 500: a site with no usable icon is an expected answer, and the
+    // message is written for the founder to act on ("upload one instead").
+    if (result.error) return res.status(422).json(result);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ── Findings (Audit Centre) ──────────────────────────────────────────────────
 
