@@ -11,22 +11,12 @@
 import { Router } from "express";
 import ClientRequest from "../models/ClientRequest.js";
 import { sendFounderEmail } from "../mailer.js";
+import { pub, nextSeqId } from "./requestInbox.js";
 
 const router = Router();
 
-// Next sequential id ("cr1", "cr2", …) — same scheme the auth routes use for
-// users/brand-credentials. Assigned server-side so the landing page never has
-// to know our id format.
-async function nextId() {
-  const docs = await ClientRequest.find({}, { _id: 1 }).lean();
-  const max = docs.reduce((m, d) => {
-    const match = /^cr(\d+)$/.exec(d._id || "");
-    return match ? Math.max(m, parseInt(match[1], 10)) : m;
-  }, 0);
-  return `cr${max + 1}`;
-}
-
-const pub = ({ _id, ...rest }) => ({ id: _id, ...rest });
+// Sequential ids: "cr1", "cr2", … — see requestInbox.js.
+const nextId = () => nextSeqId(ClientRequest, "cr");
 
 // POST /api/client-requests — public landing-page submission.
 router.post("/api/client-requests", async (req, res) => {

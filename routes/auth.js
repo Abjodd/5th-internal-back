@@ -114,13 +114,65 @@ router.post("/api/auth/login", loginHandler(User));
 router.post("/api/auth/portal-login", loginHandler(
   BrandCredential,
   async (doc) => {
-    // Only the name is read, so the logo bytes are projected away rather than
-    // pulled across on every portal sign-in.
-    const client = await Client.findById(doc.brandId, { name: 1 }).lean();
-    return client && { brandId: doc.brandId, clientName: client.name };
+    // The logo BYTES are still projected away — only the witness timestamp
+    // travels, which is all the portal needs to build the cache-busted URL for
+    // /api/clients/:id/avatar. That URL is the fallback picture for a member
+    // who hasn't uploaded their own, so it has to be known from sign-in
+    // onwards rather than fetched again by every page that renders an avatar.
+    const client = await Client.findById(doc.brandId, { name: 1, avatarUpdatedAt: 1 }).lean();
+    return client && {
+      brandId: doc.brandId,
+      clientName: client.name,
+      brandHasLogo: !!client.avatarUpdatedAt,
+      brandLogoUpdatedAt: client.avatarUpdatedAt || null,
+    };
   },
   "This login isn't linked to an active client yet."
 ));
+
+// PATCH /api/portal/account/:id — a brand member editing their own details
+// from the portal's Settings → Profile.
+//
+// Deliberately NOT the generic /api/brand-credentials/:id PATCH the founder's
+// Auth page uses. That route writes whatever it is given, and `brandId` is one
+// of those fields — a portal user able to set their own brandId could read
+// another brand's entire account. This one writes three fields and can never
+// write a fourth, which is the same allowlist reasoning as CREATOR_PUBLIC and
+// CLIENT_PUBLIC on the other /api/portal routes.
+//
+// `username` stays out on purpose: it is the login identity, it has a
+// uniqueness rule the founder's route enforces, and changing it here would let
+// someone lock themselves out of their own portal.
+const PORTAL_EDITABLE = ["name", "title", "phone"];
+
+router.patch("/api/portal/account/:id", async (req, res) => {
+  try {
+    const patch = {};
+    for (const key of PORTAL_EDITABLE) {
+      if (key in req.body) patch[key] = String(req.body[key] ?? "").trim();
+    }
+    if (!Object.keys(patch).length)
+      return res.status(400).json({ error: "No editable fields in the request." });
+    if ("name" in patch && !patch.name)
+      return res.status(400).json({ error: "Name can't be empty." });
+
+    // Initials are STORED (they're what every list row renders when there's no
+    // photo), so renaming yourself has to refresh them or the internal Auth
+    // table keeps showing the old person's letters against the new name.
+    if (patch.name)
+      patch.avatar = patch.name.split(/\s+/).map((w) => w[0]).filter(Boolean).slice(0, 2).join("").toUpperCase();
+
+    const updated = await BrandCredential.findOneAndUpdate(
+      { _id: req.params.id, deleted: { $ne: true } },
+      { $set: patch },
+      { new: true, projection: OMIT_AVATAR }
+    ).lean();
+    if (!updated) return res.status(404).json({ error: "not found" });
+    res.json(pub(updated));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // CRUD factory for the two credential collections. Same shape as server.js's
 // registerCrudRoutes but: password → hashKey + encrypted passKey on

@@ -151,3 +151,28 @@ export async function sendCreatorApplicationEmail(reqDoc) {
     }),
   });
 }
+
+/** Notify the founder of a new job application (Careers page form). */
+export async function sendCareerApplicationEmail(reqDoc) {
+  const who = reqDoc.name || reqDoc.email || "Someone";
+  // The stored title, not a lookup against the openings list — a request for a
+  // since-retired opening must still say what it was applied for.
+  const role = reqDoc.roleTitle || reqDoc.roleId || "General application";
+  return send({
+    subject: `New job application — ${who} for ${role}`,
+    label: reqDoc.id || "career application",
+    html: shell({
+      heading: "New job application received",
+      intro: `<strong>${esc(who)}</strong> applied for <strong>${esc(role)}</strong> through the Careers page.`,
+      rows: [
+        row("Name", reqDoc.name),
+        row("Email", reqDoc.email),
+        row("Role", role),
+        row("Portfolio / LinkedIn", reqDoc.link),
+      ].join(""),
+      highlight: reqDoc.note ? { label: "Why 5th Avenue", value: reqDoc.note } : null,
+      ctaUrl: tab("career-requests"),
+      ctaLabel: "Review in Career Requests",
+    }),
+  });
+}
