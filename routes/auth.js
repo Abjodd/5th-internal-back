@@ -120,11 +120,31 @@ router.post("/api/auth/portal-login", loginHandler(
     // who hasn't uploaded their own, so it has to be known from sign-in
     // onwards rather than fetched again by every page that renders an avatar.
     const client = await Client.findById(doc.brandId, { name: 1, avatarUpdatedAt: 1 }).lean();
-    return client && {
+    if (!client) return null;
+
+    // First sign-in ever? The portal lands a brand on their profile that once,
+    // and on the dashboard every time after. The witness lives on the record,
+    // not in sessionStorage, which would say "first" again on every new device.
+    //
+    // Best-effort: login was read-only before this, and a bookkeeping write
+    // must not turn a valid password into a 500. A lost stamp costs one extra
+    // profile landing. Runs after the password check, so a failed attempt
+    // can't burn someone's first login.
+    const firstLogin = !doc.firstLoginAt;
+    if (firstLogin) {
+      try {
+        await BrandCredential.updateOne({ _id: doc._id }, { $set: { firstLoginAt: new Date() } });
+      } catch (err) {
+        console.warn("[portal-login] could not stamp firstLoginAt for", doc._id, err.message);
+      }
+    }
+
+    return {
       brandId: doc.brandId,
       clientName: client.name,
       brandHasLogo: !!client.avatarUpdatedAt,
       brandLogoUpdatedAt: client.avatarUpdatedAt || null,
+      firstLogin,
     };
   },
   "This login isn't linked to an active client yet."
@@ -169,6 +189,74 @@ router.patch("/api/portal/account/:id", async (req, res) => {
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
     res.json(pub(updated));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/portal/account/:id/password — a brand member changing their own
+// sign-in password from the portal's Settings > Profile.
+//
+// The current password IS the authorisation: these routes carry no session
+// token, so the id alone — shown in the portal as "Account ID" — must not be
+// enough to take an account over.
+//
+// hashKey and passKey are always written together. The founder's Auth page
+// reveals a password by decrypting passKey, so updating only the login hash
+// would leave that page showing one that no longer works.
+const MIN_PASSWORD = 8;
+
+// Per-account failure limit, so the current-password check can't be guessed at.
+// In memory: costs nothing, and a stored counter would be a lockout that then
+// needs its own route to clear.
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+const attempts = new Map(); // id -> { count, first }
+
+function attemptsLeft(id) {
+  const rec = attempts.get(id);
+  if (!rec || Date.now() - rec.first > LOCKOUT_MS) { attempts.delete(id); return MAX_ATTEMPTS; }
+  return MAX_ATTEMPTS - rec.count;
+}
+
+function recordFailure(id) {
+  const rec = attempts.get(id);
+  if (!rec || Date.now() - rec.first > LOCKOUT_MS) attempts.set(id, { count: 1, first: Date.now() });
+  else rec.count += 1;
+}
+
+router.post("/api/portal/account/:id/password", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const currentPassword = String(req.body?.currentPassword ?? "");
+    const newPassword = String(req.body?.newPassword ?? "");
+
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ error: "Current and new password are both required." });
+    if (newPassword.length < MIN_PASSWORD)
+      return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD} characters.` });
+    if (newPassword === currentPassword)
+      return res.status(400).json({ error: "New password must be different from your current one." });
+    if (attemptsLeft(id) <= 0)
+      return res.status(429).json({ error: "Too many incorrect attempts. Try again in 15 minutes." });
+
+    const doc = await BrandCredential.findOne(
+      { _id: id, deleted: { $ne: true } },
+      { hashKey: 1 },
+    ).lean();
+    // One message for both cases — telling them apart reveals which ids exist.
+    if (!doc || doc.hashKey !== hashPassword(currentPassword)) {
+      recordFailure(id);
+      return res.status(401).json({ error: "Current password is incorrect." });
+    }
+
+    await BrandCredential.updateOne(
+      { _id: id },
+      { $set: { hashKey: hashPassword(newPassword), passKey: encryptPassword(newPassword) } },
+    );
+    attempts.delete(id);
+    res.json({ ok: true });   // never echo password material back
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
