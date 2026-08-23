@@ -19,6 +19,8 @@ const BrandCredentialSchema = new mongoose.Schema(
     // omitted from every list response — served from GET …/:id/avatar instead.
     ...AVATAR_FIELDS,
     hashKey: String,              // sha256(password)
+    // Set by portal-login on the first sign-in ever; absent = never signed in.
+    firstLoginAt: Date,
     deleted: Boolean,
     deletedAt: Date,
   },
