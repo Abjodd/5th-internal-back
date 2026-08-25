@@ -6,56 +6,102 @@
  *
  * Mongo knows *which* posts exist: every roster row that has gone live carries
  * `live.postUrl` (and, on newer rows, `live.postUrls[]`). That is the whole of
- * what we store — a permalink and a date. It is enough for the Deliverables tab,
- * which only ever renders a link and the numbers refreshPostMetrics.js writes
- * back onto `tracking`.
+ * what campaigns store — a permalink and a date. It is enough for the
+ * Deliverables tab, which only renders a link and the numbers
+ * refreshPostMetrics.js writes back onto `tracking`.
  *
- * A shelf of playing video needs three things Mongo has never held: the video
- * file, a poster frame, and the caption. Those live only on Instagram's own
- * media object, which we reach through HikerAPI — the same key and the same
- * /v2/media/by/url endpoint postMetrics.js already uses for view counts.
+ * A shelf of playing video needs three things the campaign never held: the
+ * video file, a poster frame, and the caption. Those live on Instagram's media
+ * object, which we reach through HikerAPI's /v2/media/by/url.
  *
- * WHY THE URLS ARE NOT WRITTEN BACK TO MONGO
+ * ── WHAT CHANGED, AND WHY THE OLD VERSION BURNED CREDITS ────────────────────
+ *
+ * This file used to fetch on the REQUEST PATH, behind a `new Map()` guarded by
+ * a 24h TTL. The TTL was correct; the storage was not. A Map lives in process
+ * memory, so it was emptied by every deploy, every crash, and every idle-
+ * instance recycle. What the old header described as "one HikerAPI call per
+ * post per day regardless of how many people at the brand open the page" was
+ * in practice one call per post per COLD START. On a host that sleeps an idle
+ * service, that is a full-price refetch of the entire shelf every time someone
+ * opens the portal after a quiet spell — which is the charge that showed up on
+ * the bill.
+ *
+ * Two changes fix it:
+ *
+ *   1. The cache is a Mongo collection (models/ReelCache.js), so it survives
+ *      the restart that was causing the refetch.
+ *   2. Nothing on the request path fetches. getClientReels() is now a read.
+ *      Population happens on a schedule (refreshAllReels, wired up in
+ *      scheduler.js) and — for free — off the media objects the nightly
+ *      post-metrics job is ALREADY paying for.
+ *
+ * That second point is where most of the saving is. refreshPostMetrics.js has
+ * always called the same /v2/media/by/url endpoint on the same post URLs every
+ * night, kept `like_count`/`play_count`/etc. and discarded the rest of the
+ * response — including the video, poster and caption this file was then buying
+ * a SECOND time. cacheReelFromMedia() below lets that job hand the leftovers
+ * over, so a post on an active campaign now costs one call a night in total
+ * instead of two-plus.
+ *
+ * ── WHY THE TTL CANNOT SIMPLY BE RAISED ─────────────────────────────────────
  *
  * Instagram signs its CDN links with an expiry (`&oe=` — hex unix seconds).
- * Measured against live posts: video ~32h, poster image ~106h. Persisting them
- * would mean a collection that is authoritative-looking and quietly wrong a day
- * later, and nothing on the read path could tell a fresh URL from a dead one.
- * So the media object is cached in memory for a day instead. A cache entry that
- * expires is simply refetched; a stored one that expires is a broken <video>.
+ * Measured against live posts: video ~32h, poster image ~106h. The refresh
+ * cadence therefore has a hard ceiling that is not a matter of taste — past
+ * ~32h the stored video URL stops resolving and the card renders a dead
+ * player. 24h is the longest interval that still hands the browser a link
+ * certain to work, with ~8h of slack for a missed or slow run.
  *
- * The 24h TTL sits inside the video's ~32h signature on purpose. It is the
- * longest window that still hands the browser a link certain to resolve, and it
- * costs one HikerAPI call per post per day regardless of how many people at the
- * brand open the page.
+ * Raising it to 48h would leave every video broken for roughly the last third
+ * of each cycle. It costs nothing to keep it at 24h, because the call it rides
+ * on is one the post-metrics job was making anyway.
  */
 import Campaign from "./models/Campaign.js";
+import ReelCache from "./models/ReelCache.js";
 import { hydrateCampaignCreators } from "./creatorSync.js";
 
 const IG_MEDIA_V2 = "https://api.hikerapi.com/v2/media/by/url";
 const HIKER_TOKEN = process.env.HIKERAPI_TOKEN;
 const DEBUG = process.env.IG_DEBUG !== "0";
 
-// A day, matching the comment above. Overridable so a developer can shorten it
-// while working on the page without editing code and forgetting to put it back.
+/* A day. Overridable so a developer can shorten it while working on the page,
+ * but see the header before lengthening it: above ~32h the stored video URL is
+ * expired and the shelf plays nothing. */
 const TTL_MS = Number(process.env.PORTAL_REELS_TTL_MS) || 24 * 60 * 60 * 1000;
 
-// Cold posts only — anything cached is skipped — so this bounds a first load,
-// not steady state. Kept low because HikerAPI rate-limits per key and this
-// shares that key with the nightly refresh and the Add Creator lookup.
-const CONCURRENCY = 4;
+/* How long a FAILED post is left alone before it is tried again. A post that
+ * was deleted or made private on Instagram will never fetch again; without a
+ * backoff those few dead links become a permanent daily charge for nothing. */
+const RETRY_MS = Number(process.env.PORTAL_REELS_RETRY_MS) || 6 * 60 * 60 * 1000;
+
+/* Serial with a gap, matching refreshPostMetrics.js. HikerAPI rate-limits per
+ * key and this shares that key with the metrics job and the Add Creator
+ * lookup; a burst is the reliable way to get throttled. */
+const GAP_MS = Number(process.env.PORTAL_REELS_GAP_MS) || 400;
+
+/* A ceiling on what one scheduled pass may spend, so a bad day cannot turn
+ * into an unbounded bill. Entries are refreshed stalest-first, so a capped run
+ * still makes correct progress and the remainder is picked up next pass. */
+const MAX_PER_RUN = Number(process.env.PORTAL_REELS_MAX_PER_RUN) || 400;
+
+/* Whether a post the cache has NEVER seen may be fetched on the request path.
+ *
+ * This is not a reopening of the old behaviour. The old code refetched a post
+ * whenever the process had restarted, without limit and forever. This fills a
+ * genuine first-sight gap — a creator's post that went live since the last
+ * scheduled pass — and because the result is PERSISTED (including failures,
+ * which write `attemptedAt`), it can happen at most once per post for the
+ * lifetime of that post. Set to 0 to make reads strictly database-only and let
+ * a new reel wait for the next job run to appear.
+ */
+const FILL_ON_READ = process.env.PORTAL_REELS_FILL_ON_READ !== "0";
+const MAX_FILL_ON_READ = Number(process.env.PORTAL_REELS_MAX_FILL) || 12;
 
 function log(...args) {
   if (DEBUG) console.log("[portalReels]", ...args);
 }
 
-/* ── cache ─────────────────────────────────────────────────────────────────
- * Keyed by post URL, not by client: two campaigns can carry the same post, and
- * the media object is identical either way. Process-local by design — the API
- * is a single always-on service (see refreshPostMetrics.js on why there is no
- * external cron), so there is no second instance to share a cache with.
- */
-const cache = new Map(); // url -> { at: epochMs, media: object|null }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Highest-fidelity progressive MP4 the response offers.
  *
@@ -100,8 +146,11 @@ const count = (...vals) => {
  * monetisation flags that mean nothing here; a denylist would publish every one
  * of them the day Instagram adds it. Everything below is already public on the
  * post itself.
+ *
+ * That mattered when this was a response shape. It matters more now that it is
+ * also the STORED shape: what this function keeps is what lands in Mongo.
  */
-function toReel(m, ctx) {
+export function toReel(m, ctx = {}) {
   // `kind` is the whole reason photos travel at all. The shelf treats the two
   // differently on hover — a reel starts playing, a still only lifts — and that
   // decision cannot be made from the presence of a video URL alone: a feed
@@ -144,24 +193,63 @@ function toReel(m, ctx) {
     // is what the card reads to decide whether to show a multi-image badge.
     slides: m.media_type === 8 ? (m.carousel_media?.length ?? null) : null,
     takenAt: m.taken_at ? new Date(m.taken_at * 1000).toISOString() : null,
-    // Which campaign this post was delivered for. The shelf does not group by
-    // it today, but it is the brand's own campaign name and the obvious next
-    // filter, so it travels rather than being refetched later.
-    campaign: ctx.campaign || null,
+    // Deliberately NOT stored: `campaign`. It is a campaign NAME, and a name is
+    // editable — a cached copy would go stale the moment someone renames the
+    // campaign in the internal app. getClientReels() reattaches it at read time
+    // from the live campaign document, which costs nothing because that query
+    // is how we resolved the post list in the first place.
   };
 }
 
-/** One media object, from cache when fresh. Never throws. */
-async function fetchMedia(url) {
-  const hit = cache.get(url);
-  if (hit && Date.now() - hit.at < TTL_MS) return hit.media;
+/**
+ * Persist one reel from a media object somebody has ALREADY paid for.
+ *
+ * The reason this is exported: refreshPostMetrics.js hits the very same
+ * /v2/media/by/url on the very same URLs every night and throws away
+ * everything except four counts. Handing the response here makes the portal's
+ * copy a by-product of a call that was already on the bill, which is what
+ * takes an active campaign's cost from two calls per post per day to one.
+ *
+ * Never throws — a bookkeeping write must not be able to fail the job it rides
+ * on. A missed upsert just means the scheduled reels pass picks the post up.
+ */
+export async function cacheReelFromMedia(postUrl, media, ctx = {}) {
+  if (!postUrl) return null;
+  const now = new Date();
+  try {
+    if (!media) {
+      // Record the attempt so a dead post backs off, but leave `reel` and
+      // `fetchedAt` untouched: whatever we last managed to read stays on the
+      // shelf. The video signature outlives the TTL by ~8h, so a stale hit is
+      // still likely to play — and a reel that vanishes on a bad upstream day
+      // reads to the brand as us having lost their post.
+      await ReelCache.updateOne(
+        { _id: postUrl },
+        { $set: { attemptedAt: now, lastError: "no media in response" } },
+        { upsert: true },
+      );
+      return null;
+    }
+    const reel = toReel(media, { ...ctx, postUrl });
+    await ReelCache.updateOne(
+      { _id: postUrl },
+      { $set: { reel, fetchedAt: now, attemptedAt: now, lastError: null } },
+      { upsert: true },
+    );
+    return reel;
+  } catch (e) {
+    log(`cache write ${postUrl}: ${e.message}`);
+    return null;
+  }
+}
 
+/** One media object, straight from HikerAPI. Never throws. Returns null on any
+ *  failure — the caller decides what a failure means. */
+async function fetchMedia(url) {
   if (!HIKER_TOKEN) {
     log("HIKERAPI_TOKEN not set in backend/.env");
-    return hit?.media ?? null;
+    return null;
   }
-
-  let media = null;
   try {
     const res = await fetch(`${IG_MEDIA_V2}?${new URLSearchParams({ url })}`, {
       headers: { "x-access-key": HIKER_TOKEN },
@@ -169,30 +257,34 @@ async function fetchMedia(url) {
     const text = await res.text();
     if (res.status !== 200) {
       log(`media ${url} failed status=${res.status}`, text.slice(0, 200));
-    } else {
-      media = JSON.parse(text)?.items?.[0] ?? null;
-      if (!media) log(`media ${url}: no items[] in response`);
+      return null;
     }
+    const media = JSON.parse(text)?.items?.[0] ?? null;
+    if (!media) log(`media ${url}: no items[] in response`);
+    return media;
   } catch (e) {
     log(`media ${url}: ${e.message}`);
+    return null;
   }
-
-  // A failed refetch keeps serving yesterday's entry rather than dropping the
-  // card off the shelf. The signature outlives the TTL by ~8h, so a stale hit
-  // is still very likely to play — and a reel that vanishes on a bad upstream
-  // day reads to the brand as us having lost their post.
-  if (media === null && hit) {
-    log(`serving stale entry for ${url}`);
-    return hit.media;
-  }
-
-  cache.set(url, { at: Date.now(), media });
-  return media;
 }
 
-/** Every Instagram post this client has live, deduped, newest campaign first. */
-async function collectPosts(clientName) {
-  const campaigns = await Campaign.find({ client: clientName, deleted: { $ne: true } }).lean();
+/** Fetch one post and store it. The only place in this file that spends a
+ *  credit; everything else reads Mongo. */
+async function fetchAndCache(post) {
+  const media = await fetchMedia(post.postUrl);
+  return cacheReelFromMedia(post.postUrl, media, post);
+}
+
+/**
+ * Every Instagram post the given client has live, deduped, with the handle and
+ * campaign name each came from. Pass no client to sweep every brand — that is
+ * what the scheduled refresh does.
+ */
+export async function collectPosts(clientName = null) {
+  const filter = { deleted: { $ne: true } };
+  if (clientName) filter.client = clientName;
+
+  const campaigns = await Campaign.find(filter).lean();
   // Roster rows carry no `handle` of their own since creator profiles moved to
   // the creators collection — without this the fallback username is undefined
   // for every post. Same rejoin every other read path performs; see the note on
@@ -222,29 +314,19 @@ async function collectPosts(clientName) {
   return posts;
 }
 
-/** Map with a bounded number of in-flight requests. */
-async function pooled(items, limit, fn) {
-  const out = new Array(items.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (next < items.length) {
-        const i = next++;
-        out[i] = await fn(items[i]);
-      }
-    })
-  );
-  return out;
-}
-
 /**
- * The brand's reels, newest first.
+ * The brand's reels, newest first — read from Mongo.
+ *
+ * This is the request path, and in steady state it costs zero HikerAPI calls
+ * however many people at the brand open the page, however many times, and
+ * whether or not the process restarted five seconds ago. That last clause is
+ * the entire point of the change.
  *
  * Both reels and stills come back, tagged with `kind` — the shelf renders a
  * still as a card that only enlarges on hover, so a photo post is content here
  * rather than something to filter away.
  *
- * Posts that fail to fetch, or that carry neither a video nor a usable
+ * Posts with no cached media, or that carry neither a video nor a usable
  * thumbnail, drop out silently — a partial shelf is the right failure here.
  * The page's own empty state covers the case where nothing survives.
  */
@@ -252,12 +334,100 @@ export async function getClientReels(clientName) {
   const posts = await collectPosts(clientName);
   if (!posts.length) return [];
 
-  const media = await pooled(posts, CONCURRENCY, (p) => fetchMedia(p.postUrl));
-  const reels = media
-    .map((m, i) => (m ? toReel(m, posts[i]) : null))
-    .filter(Boolean);
+  const urls = posts.map((p) => p.postUrl);
+  const rows = await ReelCache.find({ _id: { $in: urls } }).lean();
+  const byUrl = new Map(rows.map((r) => [r._id, r]));
+
+  // First sight only: a post that went live since the last scheduled pass has
+  // no row at all. See FILL_ON_READ — this is bounded, persisted (so it cannot
+  // repeat for the same post), and skipped entirely when disabled.
+  const unseen = FILL_ON_READ ? posts.filter((p) => !byUrl.has(p.postUrl)) : [];
+  if (unseen.length) {
+    const batch = unseen.slice(0, MAX_FILL_ON_READ);
+    log(`${clientName}: ${unseen.length} post(s) never cached, filling ${batch.length}`);
+    for (const p of batch) {
+      const reel = await fetchAndCache(p);
+      byUrl.set(p.postUrl, { _id: p.postUrl, reel });
+      await sleep(GAP_MS);
+    }
+  }
+
+  const reels = [];
+  for (const p of posts) {
+    const cached = byUrl.get(p.postUrl)?.reel;
+    if (!cached) continue;
+    reels.push({
+      ...cached,
+      // Reattached from the live campaign rather than read from the cache, so
+      // a renamed campaign is correct on the shelf immediately. Same for the
+      // handle fallback, which only applies when the media carried no username.
+      username: cached.username || p.handle || null,
+      campaign: p.campaign || null,
+    });
+  }
 
   reels.sort((a, b) => (b.takenAt || "").localeCompare(a.takenAt || ""));
-  log(`${clientName}: ${posts.length} post(s) -> ${reels.length} reel(s)`);
+  log(`${clientName}: ${posts.length} post(s) -> ${reels.length} reel(s) (0 API calls)`);
   return reels;
+}
+
+/**
+ * Scheduled refresh — rewrite every cached reel whose signed CDN links are
+ * approaching expiry. Wired up in scheduler.js.
+ *
+ * Runs AFTER the nightly post-metrics job on purpose: that job has by then
+ * already refreshed, for free, every post on a campaign still in flight (see
+ * ACTIVE_STAGES in refreshPostMetrics.js). What is left for this pass to pay
+ * for is the remainder — posts on completed and archived campaigns, which the
+ * metrics job deliberately stops touching but which are still on the brand's
+ * shelf and still need a link that resolves.
+ */
+export async function refreshAllReels({ log: out = console.log } = {}) {
+  const started = Date.now();
+  const posts = await collectPosts();
+
+  const rows = await ReelCache.find({ _id: { $in: posts.map((p) => p.postUrl) } })
+    .select({ fetchedAt: 1, attemptedAt: 1 })
+    .lean();
+  const byUrl = new Map(rows.map((r) => [r._id, r]));
+
+  const now = Date.now();
+  const due = posts.filter((p) => {
+    const row = byUrl.get(p.postUrl);
+    if (!row) return true; // never fetched
+    const fetched = row.fetchedAt ? new Date(row.fetchedAt).getTime() : 0;
+    if (now - fetched < TTL_MS) return false; // still inside the signature
+    // Stale, but don't retry a failing post on every pass — see RETRY_MS.
+    const attempted = row.attemptedAt ? new Date(row.attemptedAt).getTime() : 0;
+    return now - attempted >= RETRY_MS;
+  });
+
+  // Stalest first, so a capped run always spends its budget where the links
+  // are closest to expiring rather than on whatever Mongo listed first.
+  due.sort((a, b) => {
+    const at = byUrl.get(a.postUrl)?.fetchedAt ?? 0;
+    const bt = byUrl.get(b.postUrl)?.fetchedAt ?? 0;
+    return new Date(at).getTime() - new Date(bt).getTime();
+  });
+
+  const batch = due.slice(0, MAX_PER_RUN);
+  let ok = 0, failed = 0;
+  for (const p of batch) {
+    const reel = await fetchAndCache(p);
+    if (reel === null) failed++; else ok++;
+    await sleep(GAP_MS);
+  }
+
+  const summary = {
+    posts: posts.length,
+    fresh: posts.length - due.length,
+    due: due.length,
+    attempted: batch.length,
+    ok,
+    failed,
+    skippedByCap: due.length - batch.length,
+    ms: Date.now() - started,
+  };
+  out(`[portalReels] refresh ${JSON.stringify(summary)}`);
+  return summary;
 }
