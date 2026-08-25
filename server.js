@@ -615,11 +615,15 @@ app.get("/api/portal/analytics", async (req, res) => {
       // No click tracking exists anywhere in the pipeline, so this stays an
       // estimate even when everything above it was measured.
       const clicks = Math.round(engagements * 0.08);
-      const spend  = Number(c.budget) || 0;
+      // 0 for a campaign raised before the client agreed a budget. Reported as
+      // a flag rather than left to be inferred from the zero, so the portal can
+      // label the campaign instead of charting it as having cost nothing.
+      const budgetAgreed = Number(c.budget) > 0;
+      const spend  = budgetAgreed ? Number(c.budget) : 0;
 
       events.push({
         date: c.start, campaign: c.name,
-        spend, reach, engagements, impressions, clicks,
+        spend, budgetPending: !budgetAgreed, reach, engagements, impressions, clicks,
         // Lets the portal label the campaign honestly rather than presenting
         // an estimate and a measurement in the same typeface.
         measured: measuredCreators > 0,
@@ -628,8 +632,12 @@ app.get("/api/portal/analytics", async (req, res) => {
 
       // Spend split by service — same period filter as the events above, so
       // "Spend Split · selected period" actually reflects the period.
+      // Skipped entirely when nothing has been agreed. `+ 0` still CREATES the
+      // bucket, so a service whose only campaign has no budget yet appeared in
+      // the client's spend split at ₹0 — a service we are billing them nothing
+      // for, listed alongside ones we are.
       const svc = (c.service || "Other").trim();
-      spendByService[svc] = (spendByService[svc] || 0) + spend;
+      if (budgetAgreed) spendByService[svc] = (spendByService[svc] || 0) + spend;
     });
 
     res.json({
