@@ -33,6 +33,14 @@ const CampaignSchema = new mongoose.Schema(
     // hold a delivery stage that disagrees with its own roster.
     stage: String,
     progress: Number,
+    // NULL is a real, meaningful state for both: a campaign can be raised
+    // before the client has agreed a number at all. Absent, never 0 — the
+    // frontend's hasBudget() (5th-internal-front src/lib/campaign.js) keys
+    // every "budget not agreed yet" screen off the difference, and a 0 stored
+    // here would read as "agreed at nothing" on all of them.
+    //
+    // Deliberately no `budgetPending` flag: the absence IS the state, and a
+    // second field recording the same fact could disagree with it.
     budget: Number,
     creatorBudget: Number,
     numReq: Number,

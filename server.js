@@ -19,6 +19,7 @@ import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
+import { getClientReels } from "./portalReels.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
@@ -493,6 +494,23 @@ function parseFollowers(raw) {
 }
 
 // ── Client Portal Analytics ─────────────────────────────────────────────────
+// GET /api/portal/reels?client=NAME — the brand's live campaign posts, with
+// the video, poster and caption Instagram holds, for the portal's Reels shelf.
+//
+// No allowlist pass here, unlike the two routes above: portalReels.js builds
+// each reel field by field from the media object, so nothing internal is in the
+// payload to strip. Everything returned is already public on the post itself.
+// See that file for why the CDN links are cached for a day rather than stored.
+app.get("/api/portal/reels", async (req, res) => {
+  try {
+    const client = req.query.client;
+    if (!client) return res.status(400).json({ error: "client query param is required" });
+    res.json({ reels: await getClientReels(client) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/portal/analytics?client=NAME&from=ISO&to=ISO
 // Returns one dated event per campaign in the period (spend/reach/engagement
 // metrics, dated by campaign start) plus a spend-by-service split. The portal
@@ -597,11 +615,15 @@ app.get("/api/portal/analytics", async (req, res) => {
       // No click tracking exists anywhere in the pipeline, so this stays an
       // estimate even when everything above it was measured.
       const clicks = Math.round(engagements * 0.08);
-      const spend  = Number(c.budget) || 0;
+      // 0 for a campaign raised before the client agreed a budget. Reported as
+      // a flag rather than left to be inferred from the zero, so the portal can
+      // label the campaign instead of charting it as having cost nothing.
+      const budgetAgreed = Number(c.budget) > 0;
+      const spend  = budgetAgreed ? Number(c.budget) : 0;
 
       events.push({
         date: c.start, campaign: c.name,
-        spend, reach, engagements, impressions, clicks,
+        spend, budgetPending: !budgetAgreed, reach, engagements, impressions, clicks,
         // Lets the portal label the campaign honestly rather than presenting
         // an estimate and a measurement in the same typeface.
         measured: measuredCreators > 0,
@@ -610,8 +632,12 @@ app.get("/api/portal/analytics", async (req, res) => {
 
       // Spend split by service — same period filter as the events above, so
       // "Spend Split · selected period" actually reflects the period.
+      // Skipped entirely when nothing has been agreed. `+ 0` still CREATES the
+      // bucket, so a service whose only campaign has no budget yet appeared in
+      // the client's spend split at ₹0 — a service we are billing them nothing
+      // for, listed alongside ones we are.
       const svc = (c.service || "Other").trim();
-      spendByService[svc] = (spendByService[svc] || 0) + spend;
+      if (budgetAgreed) spendByService[svc] = (spendByService[svc] || 0) + spend;
     });
 
     res.json({
