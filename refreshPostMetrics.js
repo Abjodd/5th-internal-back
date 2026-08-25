@@ -11,9 +11,18 @@
  * Runs in-process (see scheduler.js) rather than as an external cron because
  * the API is a single always-on service — a second scheduler would mean a
  * second deploy target and a second set of credentials for one job.
+ *
+ * ── This job also feeds the client portal's Reels shelf ─────────────────────
+ * Each Instagram post here is fetched from HikerAPI's /v2/media/by/url, and
+ * the response carries the video, poster frame and caption alongside the four
+ * counts this job keeps. Those extras used to be dropped on the floor and then
+ * bought a SECOND time by portalReels.js on the portal's request path. They
+ * are now handed to cacheReelFromMedia() instead, so an in-flight campaign's
+ * post costs one call a night in total rather than two-plus.
  */
 import Campaign from "./models/Campaign.js";
-import { fetchPostMetrics } from "./postMetrics.js";
+import { fetchPostMetrics, RAW_MEDIA } from "./postMetrics.js";
+import { cacheReelFromMedia } from "./portalReels.js";
 import { withHistory } from "./trackingHistory.js";
 
 // Only campaigns with work in flight. Mirrors the frontend's finance track
@@ -59,7 +68,7 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
     stage: { $in: ACTIVE_STAGES },
   }).lean();
 
-  let posts = 0, ok = 0, failed = 0, touched = 0;
+  let posts = 0, ok = 0, failed = 0, touched = 0, reelsCached = 0;
 
   for (const camp of campaigns) {
     const creators = camp.creators || [];
@@ -75,6 +84,18 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
         try {
           const m = await fetchPostMetrics(url, cr.platform);
           if (m?.error) { failed++; } else { ok++; results.push(m); }
+          // The portal's Reels shelf needs the video, poster and caption from
+          // this exact response, and used to buy them in a second call to the
+          // same HikerAPI endpoint on the same URL. Storing them here makes
+          // that second call unnecessary: a post on an active campaign now
+          // costs one call a night in total instead of two. Only the v2 branch
+          // carries the media (see RAW_MEDIA); a v1 fallback or a YouTube link
+          // simply leaves the reels job to cover that post on its own pass.
+          const media = m?.[RAW_MEDIA];
+          if (media) {
+            reelsCached++;
+            await cacheReelFromMedia(url, media, { handle: cr.handle, campaign: camp.name });
+          }
         } catch (e) {
           // One unreachable post must never abort the run — the remaining
           // campaigns would silently keep yesterday's numbers.
@@ -121,7 +142,7 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
     }
   }
 
-  const summary = { campaigns: campaigns.length, updated: touched, posts, ok, failed, ms: Date.now() - started };
+  const summary = { campaigns: campaigns.length, updated: touched, posts, ok, failed, reelsCached, ms: Date.now() - started };
   log(`[refreshPostMetrics] ${JSON.stringify(summary)}`);
   return summary;
 }

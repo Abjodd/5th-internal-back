@@ -19,7 +19,7 @@ import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
-import { getClientReels } from "./portalReels.js";
+import { getClientReels, refreshAllReels } from "./portalReels.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
@@ -500,7 +500,12 @@ function parseFollowers(raw) {
 // No allowlist pass here, unlike the two routes above: portalReels.js builds
 // each reel field by field from the media object, so nothing internal is in the
 // payload to strip. Everything returned is already public on the post itself.
-// See that file for why the CDN links are cached for a day rather than stored.
+//
+// This route makes NO HikerAPI call in steady state — it reads the reel_cache
+// collection, which the nightly jobs populate (and which the post-metrics job
+// fills for free from calls it was already making). It used to fetch behind a
+// process-local Map, which meant every deploy or idle recycle re-bought the
+// whole shelf; see the header of portalReels.js.
 app.get("/api/portal/reels", async (req, res) => {
   try {
     const client = req.query.client;
@@ -657,6 +662,18 @@ app.get("/api/portal/analytics", async (req, res) => {
 app.post("/api/post-metrics/refresh-all", async (req, res) => {
   try {
     res.json(await refreshAllPostMetrics());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/portal/reels/refresh-all — run the reel-cache job now.
+// Same purpose as the route above: verify the job, or repopulate after an
+// outage, without waiting for 01:00 IST. Honours the TTL, so calling it twice
+// in a row costs nothing the second time.
+app.post("/api/portal/reels/refresh-all", async (req, res) => {
+  try {
+    res.json(await refreshAllReels());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -28,6 +28,7 @@
  */
 import JobRun from "./models/JobRun.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
+import { refreshAllReels } from "./portalReels.js";
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 // setTimeout clamps to a 32-bit ms delay (~24.9 days), so a daily gap is
@@ -64,6 +65,27 @@ const JOBS = [
     name: "post-metrics-refresh",
     hourIST: 0, // midnight IST
     run: refreshAllPostMetrics,
+  },
+  {
+    // Keeps the client portal's Reels shelf playable. Instagram signs its CDN
+    // links with a ~32h expiry, so a stored video URL has to be rewritten
+    // inside that window or the card renders a dead player — see portalReels.js.
+    //
+    // 01:00, an hour behind the metrics job, is the point of the pairing: that
+    // job refreshes the reel cache for free as a by-product of the media calls
+    // it was already making on every post of every in-flight campaign. By the
+    // time this runs, those are fresh and it skips them. What it actually pays
+    // for is the remainder — posts on completed and archived campaigns, which
+    // the metrics job stops touching by design but which are still on the
+    // brand's shelf.
+    //
+    // An hour is comfortably more than the metrics job takes (it is serial with
+    // a 400ms gap, so a few hundred posts is minutes) and the two are safe to
+    // overlap anyway: both write the same cache with the same upsert, and the
+    // TTL check makes a duplicate pass a no-op rather than a double charge.
+    name: "portal-reels-refresh",
+    hourIST: 1,
+    run: refreshAllReels,
   },
 ];
 

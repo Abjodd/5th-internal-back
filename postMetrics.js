@@ -29,6 +29,29 @@ import { fetchYouTubeVideoMetrics } from "./youtubeFetch.js";
  *
  * Note the response envelopes differ — v2 wraps in `items[]`, v1 is flat.
  */
+/**
+ * The raw media object, carried back beside the shaped counts.
+ *
+ * Attached as a NON-ENUMERABLE SYMBOL, and both halves of that are load-
+ * bearing. This endpoint's response is ~150 keys of Instagram internals, and
+ * callers hand our return value onward: /api/post-metrics does
+ * `res.json(result)`, and refreshPostMetrics.js builds documents out of the
+ * results it collects. A plain string key would leak the whole object into the
+ * internal app's network tab and into the campaign document.
+ *
+ * The symbol keeps it out of JSON (`JSON.stringify` ignores symbol keys).
+ * Non-enumerable keeps it out of a spread — object spread DOES copy enumerable
+ * symbol keys, so the symbol alone would not have been enough. Together they
+ * mean the value is invisible to every path that copies or serialises the
+ * result, and visible only to a caller that names RAW_MEDIA explicitly.
+ *
+ * Why it is carried at all: portalReels.js needs the video, poster and caption
+ * from this same response, and used to buy them in a second call to this same
+ * endpoint. Handing over what we already have makes that second call
+ * unnecessary — see cacheReelFromMedia() in portalReels.js.
+ */
+export const RAW_MEDIA = Symbol("hiker.rawMedia");
+
 const IG_MEDIA_V2 = "https://api.hikerapi.com/v2/media/by/url";
 const IG_MEDIA_V1 = "https://api.hikerapi.com/v1/media/by/url";
 const HIKER_TOKEN = process.env.HIKERAPI_TOKEN;
@@ -97,6 +120,10 @@ async function instagramPostMetrics(url) {
   if (item) {
     const result = shape(item);
     if (DEBUG) log("v2 media", JSON.stringify(result));
+    // Only v2 carries video_versions/image_versions2/caption, so only v2 can
+    // feed the reel cache. A v1 fallback returns counts alone and the reels
+    // job picks that post up on its own pass.
+    Object.defineProperty(result, RAW_MEDIA, { value: item, enumerable: false });
     return result;
   }
   log("v2 unusable, falling back to v1:", v2.error || "no items[] in response");
