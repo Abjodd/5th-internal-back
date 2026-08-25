@@ -19,6 +19,7 @@ import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics } from "./postMetrics.js";
+import { getClientReels } from "./portalReels.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
@@ -493,6 +494,23 @@ function parseFollowers(raw) {
 }
 
 // ── Client Portal Analytics ─────────────────────────────────────────────────
+// GET /api/portal/reels?client=NAME — the brand's live campaign posts, with
+// the video, poster and caption Instagram holds, for the portal's Reels shelf.
+//
+// No allowlist pass here, unlike the two routes above: portalReels.js builds
+// each reel field by field from the media object, so nothing internal is in the
+// payload to strip. Everything returned is already public on the post itself.
+// See that file for why the CDN links are cached for a day rather than stored.
+app.get("/api/portal/reels", async (req, res) => {
+  try {
+    const client = req.query.client;
+    if (!client) return res.status(400).json({ error: "client query param is required" });
+    res.json({ reels: await getClientReels(client) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/portal/analytics?client=NAME&from=ISO&to=ISO
 // Returns one dated event per campaign in the period (spend/reach/engagement
 // metrics, dated by campaign start) plus a spend-by-service split. The portal
