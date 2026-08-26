@@ -142,6 +142,37 @@ app.get("/api/campaigns", async (req, res) => {
   }
 });
 
+// GET /api/campaigns/brand-scope?teamId=t5 — the brandIds behind the campaigns
+// one team member is on, and nothing else.
+//
+// The app shell's brand filter needs exactly this list on EVERY page, for every
+// assignment-scoped role, so that it stops offering brands whose campaigns the
+// user cannot open. It was answering that question with GET /api/campaigns —
+// which returns every full campaign document AND runs hydrateCampaignCreators,
+// a join across the creators collection per campaign. Fetching all of that on
+// every route, to fill one dropdown, is the wrong order of magnitude by a wide
+// margin.
+//
+// `distinct` does the whole job in the database and returns a handful of
+// strings. Registered ahead of the parameterised /api/campaigns/:id routes so
+// "brand-scope" is never read as an id.
+app.get("/api/campaigns/brand-scope", async (req, res) => {
+  try {
+    const teamId = String(req.query.teamId || "").trim();
+    // No teamId means nothing is assignable to this user, which is an empty
+    // scope — NOT "show everything". Company-wide roles never call this: the
+    // client skips the request entirely (see reachableBrandIds).
+    if (!teamId) return res.json([]);
+    const brandIds = await Campaign.distinct("brandId", {
+      deleted: { $ne: true },
+      $or: [{ createdBy: teamId }, { amId: teamId }, { cmId: teamId }, { eaId: teamId }],
+    });
+    res.json(brandIds.filter(Boolean));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Denormalized creator_ids on a campaign — the same dedupe key the creators
 // directory keys on (keyOf, from creatorSync.js), so the mapping stays a
 // queryable index into the creators collection without ever drifting.
@@ -253,6 +284,12 @@ const CREATOR_PUBLIC = [
   // carries a postUrls[] array alongside the postUrl the portal reads today;
   // both travel under the one key.
   "status", "concept", "demo", "live", "tracking", "deliverables", "numDeliverables",
+  // `collab` — "collab" | "non_collab" | null. Whether the post goes up as a
+  // paid collaboration carrying the brand's own handle, or on the creator's
+  // account alone. Safe for a brand to read, and more than safe: it is a term
+  // of the deal they are paying for, and the internal app makes it a
+  // precondition of locking the creator's fee for exactly that reason.
+  "collab",
 ];
 
 app.get("/api/portal/campaigns", async (req, res) => {
