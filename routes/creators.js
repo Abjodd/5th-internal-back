@@ -10,6 +10,18 @@ import Campaign from "../models/Campaign.js";
 import Invoice from "../models/Invoice.js";
 import Creator from "../models/Creator.js";
 import { keyOf, PROFILE_FIELDS } from "../creatorSync.js";
+import { withAvatar, serveAvatar, OMIT_AVATAR } from "../avatarStore.js";
+import { applyRemoteAvatar } from "../remoteAvatar.js";
+
+// `hasAvatar` is derived from `avatarUpdatedAt`, not from the bytes — the list
+// query projects the bytes away, so the timestamp is the only witness left that
+// a photo exists. Same contract as pub() in routes/auth.js and the client rows
+// in server.js; the frontend builds the image URL from these two alone.
+const pubAvatar = ({ avatarImage, avatarUpdatedAt, ...rest }) => ({
+  ...rest,
+  hasAvatar: !!avatarUpdatedAt,
+  avatarUpdatedAt: avatarUpdatedAt || null,
+});
 
 const router = Router();
 
@@ -33,7 +45,7 @@ router.get("/api/creators", async (req, res) => {
     const activeKeys = await Campaign.distinct("creatorIds", { deleted: { $ne: true } });
 
     const [creators, campaigns, invoices] = await Promise.all([
-      Creator.find({}).sort({ name: 1 }).lean(),
+      Creator.find({}, OMIT_AVATAR).sort({ name: 1 }).lean(),
       Campaign.find({ creatorIds: { $in: activeKeys }, deleted: { $ne: true } })
         .select("name client brandId stage creators")
         .lean(),
@@ -57,7 +69,7 @@ router.get("/api/creators", async (req, res) => {
       }
     }
 
-    let rows = creators.map(({ _id, ...rest }) => ({
+    let rows = creators.map(({ _id, ...rest }) => pubAvatar({
       id: _id, ...rest,
       campaigns: campaignsByKey.get(_id) || [],
       invoices: [],
@@ -106,6 +118,21 @@ router.patch("/api/creators/:id", async (req, res) => {
     const key = String(req.params.id).toLowerCase().trim();
     const patch = {};
     for (const k of PROFILE_FIELDS) if (k in req.body) patch[k] = req.body[k];
+
+    // A photo the founder picked in the Edit modal. Three-way as everywhere
+    // else: absent leaves it alone, null clears it, a data URI replaces it.
+    try { withAvatar(patch, req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    // `avatarSourceUrl` is the platform's own picture, captured into bytes we
+    // keep — this is the path a re-run of Fetch takes, and so also the way a
+    // creator who has changed their Instagram photo gets the new one. Ignored
+    // when the body also carried an explicit upload, which is the more
+    // deliberate of the two. Silent on failure by design: a CDN that will not
+    // answer must not cost the founder the rest of their edit.
+    if (!("avatarImage" in patch) && req.body.avatarSourceUrl)
+      await applyRemoteAvatar(patch, req.body.avatarSourceUrl);
+
     if (!Object.keys(patch).length) return res.status(400).json({ error: "no editable fields in body" });
 
     const inf = await Creator.findById(key);
@@ -115,10 +142,14 @@ router.patch("/api/creators/:id", async (req, res) => {
       ...(patch.personalDetails ? { personalDetails: { ...(inf.personalDetails || {}), ...patch.personalDetails } } : {}),
     });
     await inf.save();
-    res.json({ id: key, ...inf.toObject() });
+    res.json(pubAvatar({ id: key, ...inf.toObject() }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Cached immutably and read through ?v=<avatarUpdatedAt>, so a replaced photo
+// busts the cache the instant it changes. See serveAvatar.
+router.get("/api/creators/:id/avatar", serveAvatar(Creator));
 
 export default router;

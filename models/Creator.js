@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { AVATAR_FIELDS } from "../avatarStore.js";
 
 // Creators directory — the single source of truth for a creator's profile.
 // Campaign documents no longer embed a copy of these fields: each campaign's
@@ -44,6 +45,12 @@ const CreatorSchema = new mongoose.Schema(
       ifsc: String,
       upiId: String,
     },
+    // The creator's profile photo, stored inline exactly like a user's or a
+    // brand's — see avatarStore.js for why bytes live on the document, and
+    // remoteAvatar.js for why the platform's own URL is copied rather than
+    // kept. NEVER returned by the list route; see OMIT_AVATAR in
+    // routes/creators.js.
+    ...AVATAR_FIELDS,
   },
   { strict: false, versionKey: false, timestamps: true }
 );
