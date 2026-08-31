@@ -16,6 +16,7 @@ import Creator from "../models/Creator.js";
 import { keyOf } from "../creatorSync.js";
 import { sendCreatorApplicationEmail } from "../mailer.js";
 import { pub, nextSeqId } from "./requestInbox.js";
+import { OMIT_AVATAR } from "../avatarStore.js";
 
 const router = Router();
 
@@ -148,7 +149,7 @@ router.get("/api/creator-requests/:id/promote", async (req, res) => {
     const key = keyOf(doc);
     if (!key) return res.status(400).json({ error: "application has no handle or name to key on" });
 
-    const existing = await Creator.findById(key).lean();
+    const existing = await Creator.findById(key, OMIT_AVATAR).lean();
     res.json({
       key,
       exists: !!existing,
@@ -172,7 +173,7 @@ router.post("/api/creator-requests/:id/promote", async (req, res) => {
     const key = keyOf(doc);
     if (!key) return res.status(400).json({ error: "application has no handle or name to key on" });
 
-    const existing = await Creator.findById(key).lean();
+    const existing = await Creator.findById(key, OMIT_AVATAR).lean();
     if (existing && !req.body?.overwrite) {
       return res.status(409).json({
         error: "A creator with this handle is already in the directory.",
@@ -189,7 +190,9 @@ router.post("/api/creator-requests/:id/promote", async (req, res) => {
     }
 
     await Creator.updateOne({ _id: key }, { $set: fields }, { upsert: true });
-    const creator = await Creator.findById(key).lean();
+    // Projected: this doc goes straight out in the response below, and the
+    // photo bytes have no business on that wire.
+    const creator = await Creator.findById(key, OMIT_AVATAR).lean();
 
     // The application has done its job — it produced (or updated) this
     // directory row — so it's removed rather than kept around retitled.

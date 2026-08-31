@@ -13,6 +13,8 @@
 //   routes/creators.js — the founder directory (PATCH edits the profile once)
 //   scripts/normalize-creators.js — one-off migration for existing records
 import Creator from "./models/Creator.js";
+import { fetchRemoteAvatar, isAllowedAvatarSource } from "./remoteAvatar.js";
+import { OMIT_AVATAR } from "./avatarStore.js";
 
 // Dedup key: handle when present (stable across campaigns), else name.
 export const keyOf = (cr) => String(cr?.handle || cr?.name || "").toLowerCase().trim();
@@ -42,12 +44,20 @@ export async function splitCreatorsForStorage(creators) {
   const list = creators || [];
   const keyed = list.map((cr) => ({ cr, key: keyOf(cr) }));
 
-  const withDetails = keyed.filter(({ cr, key }) => key && cr.personalDetails);
-  const existingByKey = withDetails.length
-    ? new Map((await Creator.find({ _id: { $in: withDetails.map((k) => k.key) } })
-        .select("personalDetails").lean())
-        .map((d) => [d._id, d.personalDetails || {}]))
+  // Looked up for two reasons now: to merge personalDetails onto what is
+  // already stored, and to know who already has a profile photo — a creator
+  // whose picture we hold is never re-fetched from the platform.
+  const needsLookup = keyed.filter(
+    ({ cr, key }) => key && (cr.personalDetails || photoSourceOf(cr)),
+  );
+  const existing = needsLookup.length
+    ? new Map((await Creator.find({ _id: { $in: needsLookup.map((k) => k.key) } })
+        .select("personalDetails avatarUpdatedAt").lean())
+        .map((d) => [d._id, d]))
     : new Map();
+  const existingByKey = new Map(
+    [...existing].map(([k, d]) => [k, d.personalDetails || {}]),
+  );
 
   const ops = [];
   for (const { cr, key } of keyed) {
@@ -61,7 +71,67 @@ export async function splitCreatorsForStorage(creators) {
   }
   if (ops.length) await Creator.bulkWrite(ops);
 
+  // Deliberately NOT awaited. Every creator on the roster who arrived with a
+  // platform photo and has none stored yet needs one HTTP round trip to a CDN,
+  // and putting those in front of the response would put a stranger's server on
+  // the critical path of saving a campaign — a ten-creator roster could hang
+  // the save for the full timeout. The documents are already written by this
+  // point, so the capture is a later, independent update to rows that exist;
+  // the photo simply appears on the next read.
+  captureMissingAvatars(keyed, existing);
+
   return keyed.map(({ cr, key }) => ({ ...omit(cr, PROFILE_FIELDS), creatorId: key || cr.creatorId || null }));
+}
+
+/**
+ * The platform profile picture on an incoming creator entry, if it is one we
+ * are willing to fetch. `igFetched` is the raw snapshot the Add Creator modal's
+ * Fetch button stores on the campaign's entry — it is campaign-specific and
+ * never enters the directory (see PROFILE_FIELDS), so this is the only moment
+ * the directory ever sees the creator's picture.
+ */
+const photoSourceOf = (cr) => {
+  const url = cr?.igFetched?.profilePic;
+  return url && isAllowedAvatarSource(url) ? url : null;
+};
+
+/**
+ * Copy each new creator's platform photo into bytes we own.
+ *
+ * Once only: a creator with `avatarUpdatedAt` already set is skipped, so this
+ * costs nothing on the overwhelmingly common path of re-saving a roster whose
+ * creators are all already known. Re-capturing a changed photo is a deliberate
+ * act — re-run Fetch in the Edit modal, which PATCHes `avatarSourceUrl`.
+ *
+ * Fire-and-forget, and silent: this runs after its caller has returned, so a
+ * rejection here would be an unhandled promise rejection that takes the process
+ * down under Node's default policy. Nothing it does is worth a campaign save,
+ * and a creator without a picture is a card with initials on it.
+ */
+function captureMissingAvatars(keyed, existing) {
+  const targets = keyed.filter(({ cr, key }) =>
+    key && photoSourceOf(cr) && !existing.get(key)?.avatarUpdatedAt);
+  if (!targets.length) return;
+
+  // Deduped: the same creator can appear twice on one roster.
+  const byKey = new Map(targets.map(({ cr, key }) => [key, photoSourceOf(cr)]));
+
+  (async () => {
+    const captured = await Promise.all(
+      [...byKey].map(async ([key, url]) => [key, await fetchRemoteAvatar(url)]),
+    );
+    const ops = captured
+      .filter(([, img]) => img)
+      .map(([key, img]) => ({
+        updateOne: {
+          filter: { _id: key },
+          update: { $set: { avatarImage: img, avatarUpdatedAt: new Date() } },
+        },
+      }));
+    if (ops.length) await Creator.bulkWrite(ops);
+  })().catch((err) => {
+    console.warn("[creatorSync] avatar capture failed:", err.message);
+  });
 }
 
 // Reverse of the split above — merges each campaign's creator entries with
@@ -75,7 +145,10 @@ export async function hydrateCampaignCreators(campaigns) {
     if (k) keys.add(k);
   }
   if (!keys.size) return campaigns;
-  const profiles = await Creator.find({ _id: { $in: [...keys] } }).lean();
+  // OMIT_AVATAR matters more here than anywhere: this runs on every campaign
+  // read, and without it each hydration would pull every rostered creator's
+  // photo bytes into the process only for pick() to drop them again.
+  const profiles = await Creator.find({ _id: { $in: [...keys] } }, OMIT_AVATAR).lean();
   const byKey = new Map(profiles.map((p) => [p._id, p]));
   for (const c of campaigns) {
     c.creators = (c.creators || []).map((cr) => {
