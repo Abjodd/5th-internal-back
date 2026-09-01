@@ -18,15 +18,15 @@ import Quote from "./models/Quote.js";
 import RegistryEntry from "./models/RegistryEntry.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
-import { fetchPostMetrics } from "./postMetrics.js";
-import { getClientReels, refreshAllReels } from "./portalReels.js";
+import { fetchPostMetrics, RAW_MEDIA } from "./postMetrics.js";
+import { getClientReels, refreshAllReels, cacheReelFromMedia, warmReels, getReelPoster, backfillPosters } from "./portalReels.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
 import Finding from "./models/Finding.js";
 // Brand logos ride the same machinery as user profile photos — see avatarStore.js
 // for why images live inline on the document and are served from their own route.
-import { withAvatar, serveAvatar, OMIT_AVATAR } from "./avatarStore.js";
+import { withAvatar, serveAvatar, OMIT_AVATAR, toBuffer } from "./avatarStore.js";
 import { suggestLogo } from "./faviconFetch.js";
 const app = express();
 
@@ -221,6 +221,18 @@ app.patch("/api/campaigns/:id", async (req, res) => {
     const [hydrated] = await hydrateCampaignCreators([updated]);
     const { _id, ...rest } = hydrated;
     res.json({ id: _id, ...rest });
+
+    // A save is the moment a live post URL first exists in the system. Fetching
+    // its media here — once, off the response path — is what lets the client
+    // portal's shelf be a pure database read and still show a reel the minute
+    // it is delivered, instead of on the brand's own page load or up to a day
+    // later. Same one call per post either way; only the timing moves.
+    // Not awaited, never throws: a campaign save must not wait on Instagram.
+    // `hydrated`, not `patch`: splitCreatorsForStorage moves profile fields
+    // (handle among them) out to the creators directory, so the roster we just
+    // wrote no longer carries the handle warmReels uses as a fallback username.
+    // The hydrated copy has it rejoined.
+    if ("creators" in patch) warmReels(hydrated.creators, hydrated.name);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -257,6 +269,12 @@ const CAMPAIGN_PRIVATE = [
   // (a staff teamId), the denormalized creator index, and the soft-delete
   // bookkeeping that every query already filters on.
   "createdBy", "creatorIds", "deleted", "deletedAt",
+  // The RATE the agency fee was agreed at. The fee's rupee amount goes to the
+  // client — it is a line on their own budget breakdown — but the percentage is
+  // the term we negotiate from, and it is read against the base budget, which
+  // is not a number the portal is given. Sending it would hand the brand the
+  // creator-pool split by subtraction on every campaign.
+  "agencyFeePct",
 ];
 
 // Creator fields are an ALLOWLIST, deliberately — the opposite of the campaign
@@ -290,7 +308,45 @@ const CREATOR_PUBLIC = [
   // of the deal they are paying for, and the internal app makes it a
   // precondition of locking the creator's fee for exactly that reason.
   "collab",
+  // The brand's own yes/no on this creator, made in the portal — who called it
+  // and when. Written by the decision route below; the portal reads it back to
+  // say "you approved this on the 2nd" rather than just showing the status the
+  // call produced.
+  "brandDecision",
 ];
+
+// The ONE per-creator money figure a brand may read, and it is deliberately not
+// on the allowlist above — it is RENAMED on the way out.
+//
+// Internally a roster entry carries two numbers: `cost`, what we pay the
+// creator, and `clientCost`, what the brand is charged for them. `cost` must
+// never leave the building — it is half of the margin — so it is not in
+// CREATOR_PUBLIC and never will be. The portal, meanwhile, has always spoken of
+// one per-creator figure and calls it `cost` (5th-avenue-client-front), so the
+// mapping is: internal clientCost → portal cost. Anything reading a creator's
+// `cost` on the portal side is reading what the client was billed.
+//
+// Absent stays absent — no key at all, rather than 0. A creator nobody has
+// priced for the client yet drops out of the portal's budget breakdown instead
+// of appearing in it as one given away free.
+const withClientCost = (safe, cr) => {
+  const v = cr?.clientCost;
+  if (v == null || v === "") return safe;
+  const n = Number(v);
+  return Number.isFinite(n) ? { ...safe, cost: n } : safe;
+};
+
+// The roster row's own key, renamed on the way out.
+//
+// `_id` here is a string the internal app mints on shortlist ("cr_1730_x7f")
+// — not an ObjectId, meaningless outside this roster. The portal needs a
+// stable handle to comment against the right creator; an array index breaks on
+// reorder and a handle is absent on hand-added creators. Renamed to `ref` so
+// nothing downstream mistakes it for a document id it could look up.
+const withRosterRef = (safe, cr) => {
+  const id = cr?._id;
+  return id ? { ...safe, ref: String(id) } : safe;
+};
 
 app.get("/api/portal/campaigns", async (req, res) => {
   try {
@@ -302,11 +358,184 @@ app.get("/api/portal/campaigns", async (req, res) => {
       campaigns.map(({ _id, ...c }) => {
         for (const k of CAMPAIGN_PRIVATE) delete c[k];
         c.creators = (c.creators || []).map((cr) =>
-          CREATOR_PUBLIC.reduce((safe, k) => (k in cr ? { ...safe, [k]: cr[k] } : safe), {})
+          withRosterRef(
+            withClientCost(
+              CREATOR_PUBLIC.reduce((safe, k) => (k in cr ? { ...safe, [k]: cr[k] } : safe), {}),
+              cr,
+            ),
+            cr,
+          )
         );
         return { id: _id, ...c };
       })
     );
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Asset review threads ────────────────────────────────────────────────────
+// One conversation per reviewable asset on a roster row, stored at
+// creators[].<asset>.comments and written from both ends: the brand comments
+// from the portal on the file we uploaded (<asset>.fileLink), the team replies
+// from the Deliverables tab.
+//
+// $push against the matched row, never a rewrite of creators[]. The campaign
+// PATCH saves the whole array, so a read-modify-write here would race it and
+// silently drop whichever note lost — the one failure a review thread cannot
+// have.
+const MAX_COMMENT = 2000;
+
+// The assets a client may review, and the only values `:asset` may take — it
+// is interpolated into an update path, so an allowlist is what stops a request
+// writing to an arbitrary field on the roster row.
+const REVIEWABLE = ["concept", "demo"];
+
+// The brand's call on a creator we suggested, and the internal status each
+// answer sets. A generated roster starts at `suggested` (5th-internal-front
+// CR_JOURNEY), so the decision needs no field of its own to be acted on — it
+// moves the row into the vocabulary the team already works from.
+const BRAND_DECISION = { approve: "shortlisted", reject: "brand_reject" };
+// Still the brand's call to make only while the row is at one of those three.
+// Once we've reached out, negotiated or locked, the roster has moved past the
+// question and a late flip would rewrite a deal already in progress.
+const DECIDABLE = new Set(["suggested", ...Object.values(BRAND_DECISION)]);
+
+/**
+ * Append one note and hand back the whole thread.
+ * `match` is the caller's own scoping — the portal adds the client name to it,
+ * the internal route doesn't need to.
+ */
+async function appendAssetComment(match, ref, asset, { body, role, author, accountId = null }) {
+  const campaign = await Campaign.findOne(match, { creators: 1 }).lean();
+  if (!campaign) return null;
+
+  const row = (campaign.creators || []).find((cr) => String(cr?._id) === ref);
+  if (!row) return null;
+
+  const comment = {
+    id: `cmt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    at: new Date().toISOString(),
+    body, role, author, accountId,
+  };
+  await Campaign.updateOne(match, { $push: { [`creators.$[c].${asset}.comments`]: comment } },
+    { arrayFilters: [{ "c._id": ref }] });
+
+  // The whole thread, not just the new note — either client would otherwise
+  // miss a reply that landed while its page was open.
+  return { asset, comment, comments: [...(row[asset]?.comments || []), comment] };
+}
+
+/** Shared validation, so both routes reject the same things the same way. */
+function readComment(req, res) {
+  if (!REVIEWABLE.includes(req.params.asset)) {
+    res.status(400).json({ error: `Reviewable assets are ${REVIEWABLE.join(", ")}.` });
+    return null;
+  }
+  const body = String(req.body?.text ?? "").trim();
+  if (!body) { res.status(400).json({ error: "A comment can't be empty." }); return null; }
+  if (body.length > MAX_COMMENT) {
+    res.status(400).json({ error: `Keep it under ${MAX_COMMENT} characters.` });
+    return null;
+  }
+  return body;
+}
+
+// POST /api/portal/campaigns/:id/creators/:ref/:asset/comments — the brand's note.
+//
+// The portal's only write against campaign data. Scoped like every other
+// /api/portal route: matched on the campaign id AND the client name, so a
+// guessed id from another brand matches nothing. `role` is set here and never
+// read from the request — anything arriving on this route is a client note by
+// definition.
+app.post("/api/portal/campaigns/:id/creators/:ref/:asset/comments", async (req, res) => {
+  try {
+    const client = String(req.body?.client || "").trim();
+    if (!client) return res.status(400).json({ error: "client is required" });
+    const body = readComment(req, res);
+    if (!body) return;
+
+    const result = await appendAssetComment(
+      { _id: req.params.id, client, deleted: { $ne: true } },
+      String(req.params.ref),
+      req.params.asset,
+      {
+        body, role: "client",
+        author: String(req.body?.author || "").trim() || "Client",
+        // Which portal login wrote it — their own id, never anyone else's.
+        accountId: String(req.body?.accountId || "").trim() || null,
+      },
+    );
+    if (!result) return res.status(404).json({ error: "not found" });
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/campaigns/:id/creators/:ref/:asset/comments — the team's reply,
+// from the internal Deliverables tab. Same append, so a reply and a client
+// note landing together can't overwrite each other.
+app.post("/api/campaigns/:id/creators/:ref/:asset/comments", async (req, res) => {
+  try {
+    const body = readComment(req, res);
+    if (!body) return;
+
+    const result = await appendAssetComment(
+      { _id: req.params.id, deleted: { $ne: true } },
+      String(req.params.ref),
+      req.params.asset,
+      { body, role: "team", author: String(req.body?.author || "").trim() || "5th Avenue" },
+    );
+    if (!result) return res.status(404).json({ error: "not found" });
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/portal/campaigns/:id/creators/:ref/decision — the brand's yes or no
+// on a creator we suggested.
+//
+// Writes the roster row's own `status`, so the answer lands where the internal
+// Creators tab already reads from and nothing has to be reconciled later. The
+// audit of who said it and when goes on `brandDecision` beside it. Scoped on
+// campaign id AND client name like every /api/portal route.
+app.post("/api/portal/campaigns/:id/creators/:ref/decision", async (req, res) => {
+  try {
+    const client = String(req.body?.client || "").trim();
+    if (!client) return res.status(400).json({ error: "client is required" });
+    const decision = String(req.body?.decision || "").trim();
+    const status = BRAND_DECISION[decision];
+    if (!status) return res.status(400).json({ error: "decision must be approve or reject" });
+
+    const match = { _id: req.params.id, client, deleted: { $ne: true } };
+    const ref = String(req.params.ref);
+    const campaign = await Campaign.findOne(match, { creators: 1 }).lean();
+    const row = (campaign?.creators || []).find((cr) => String(cr?._id) === ref);
+    if (!row) return res.status(404).json({ error: "not found" });
+    if (!DECIDABLE.has(row.status)) {
+      return res.status(409).json({
+        error: "This creator has already moved on from here — talk to your team.",
+      });
+    }
+
+    const brandDecision = {
+      decision,
+      at: new Date().toISOString(),
+      by: String(req.body?.author || "").trim() || "Client",
+      accountId: String(req.body?.accountId || "").trim() || null,
+    };
+    // $set through arrayFilters rather than a read-modify-write of creators[]:
+    // the internal app PATCHes that array wholesale, and rewriting it from here
+    // would drop whatever it saved in between.
+    await Campaign.updateOne(
+      match,
+      { $set: { "creators.$[c].status": status, "creators.$[c].brandDecision": brandDecision } },
+      { arrayFilters: [{ "c._id": ref }] },
+    );
+
+    res.json({ status, brandDecision });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -510,6 +739,18 @@ app.get("/api/post-metrics", async (req, res) => {
     const result = await fetchPostMetrics(url, platform);
     if (result.error) return res.status(502).json(result);
     res.json(result);
+
+    // The response we just paid for carries the video, poster and caption the
+    // portal's Reels shelf needs, and they were being dropped on the floor here
+    // — exactly the waste refreshPostMetrics.js already avoids by handing its
+    // own responses over. A hand-refreshed post now updates the brand's shelf
+    // too, for nothing.
+    //
+    // After res.json and deliberately not awaited: the Deliverables button must
+    // never wait on a cache write, and a failed one is not the caller's problem.
+    // Only the v2 branch carries RAW_MEDIA (see postMetrics.js).
+    const media = result[RAW_MEDIA];
+    if (media) cacheReelFromMedia(String(url), media, { platform }).catch(() => {});
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -530,6 +771,12 @@ function parseFollowers(raw) {
   return n * (mp[2] === "M" ? 1e6 : mp[2] === "K" ? 1e3 : 1);
 }
 
+// Is this creator's post actually up? `live.postUrls` is the real array;
+// `postUrl` is the mirrored first link kept for back-compat, so either one
+// being present is the fact. Mirrors isCreatorLive() in the portal's
+// lib/portalMetrics.js — the two apps must agree on what "live" means.
+const isCreatorLive = (cr) => !!(cr?.live?.postUrls?.length || cr?.live?.postUrl);
+
 // ── Client Portal Analytics ─────────────────────────────────────────────────
 // GET /api/portal/reels?client=NAME — the brand's live campaign posts, with
 // the video, poster and caption Instagram holds, for the portal's Reels shelf.
@@ -548,6 +795,32 @@ app.get("/api/portal/reels", async (req, res) => {
     const client = req.query.client;
     if (!client) return res.status(400).json({ error: "client query param is required" });
     res.json({ reels: await getClientReels(client) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/reels/:code/poster — one reel's cover frame, from bytes we
+// own, keyed by the Instagram shortcode.
+//
+// This route is why the shelf no longer decays. `reel.thumbnail` is a signed
+// CDN link that dies ~106h after it is issued, so every card was on a clock
+// that only a paid refresh could reset — and when a refresh was missed the
+// brand simply saw a broken tile (one post in this collection sat 50h past its
+// signature). The bytes behind this route were copied once and expire never.
+//
+// Public for the same reason the reels payload is: a campaign cover frame is
+// already public on Instagram. Immutable caching plus the `?v=` the client
+// appends means a replaced poster is picked up at once despite the long
+// max-age — the same contract as every avatar route here.
+app.get("/api/portal/reels/:code/poster", async (req, res) => {
+  try {
+    const poster = await getReelPoster(req.params.code);
+    const bytes = toBuffer(poster?.data);
+    if (!bytes) return res.status(404).json({ error: "no poster stored for this post" });
+    res.set("Content-Type", poster.contentType || "image/jpeg");
+    res.set("Cache-Control", "public, max-age=31536000, immutable");
+    res.send(bytes);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -589,6 +862,12 @@ app.get("/api/portal/reels", async (req, res) => {
 // play. Views count repeat views and non-followers (reels travel to explore),
 // whereas reach is only the creator's own follower base. That is virality, not
 // a bad number — the funnel in the portal is built to show it as a rise.
+//
+// GATED ON LIVE. Spend is committed when a campaign is booked; performance
+// only exists once something is posted. A campaign with nothing up reports
+// `live: false` and the portal drops it from every total, the trend line and
+// the spend split. `spendByService` and `excluded` are pre-aggregated on the
+// same rule — the portal can't re-derive a split it is handed as a map.
 app.get("/api/portal/analytics", async (req, res) => {
   try {
     const client = req.query.client;
@@ -614,6 +893,9 @@ app.get("/api/portal/analytics", async (req, res) => {
 
     const events = [];
     const spendByService = {};
+    // What the numbers above leave out, so the portal can say so outright
+    // instead of presenting a partial account as the whole one.
+    const excluded = { campaigns: 0, spend: 0 };
 
     campaigns.forEach(c => {
       const startDate = parseISO(c.start);
@@ -626,11 +908,12 @@ app.get("/api/portal/analytics", async (req, res) => {
       // have instead of discarding them.
       const creators = c.creators || [];
       let reach = 0, impressions = 0, engagements = 0;
-      let measuredCreators = 0;
+      let measuredCreators = 0, liveCreators = 0;
 
       creators.forEach(cr => {
         const f = parseFollowers(cr.followers) || parseFollowers(cr.igFetched?.followers);
         reach += f;
+        if (isCreatorLive(cr)) liveCreators++;
 
         // Directory ER first; otherwise derive it from the IG profile snapshot
         // stored on the campaign (avgLikes+avgComments over followers), which
@@ -662,15 +945,25 @@ app.get("/api/portal/analytics", async (req, res) => {
       // label the campaign instead of charting it as having cost nothing.
       const budgetAgreed = Number(c.budget) > 0;
       const spend  = budgetAgreed ? Number(c.budget) : 0;
+      const live = liveCreators > 0;
 
       events.push({
         date: c.start, campaign: c.name,
         spend, budgetPending: !budgetAgreed, reach, engagements, impressions, clicks,
+        // Whether anything is actually posted. The portal reads this before it
+        // reads any of the figures above — see the header note.
+        live, liveCreators,
         // Lets the portal label the campaign honestly rather than presenting
         // an estimate and a measurement in the same typeface.
         measured: measuredCreators > 0,
         measuredCreators, totalCreators: creators.length,
       });
+
+      if (!live) {
+        excluded.campaigns++;
+        excluded.spend += spend;
+        return;
+      }
 
       // Spend split by service — same period filter as the events above, so
       // "Spend Split · selected period" actually reflects the period.
@@ -685,7 +978,8 @@ app.get("/api/portal/analytics", async (req, res) => {
     res.json({
       events,
       spendByService,
-      note: "reach=followers sum; impressions/engagements measured from post metrics where available, else impressions≈reach×0.12 and engagements≈reach×avgER; clicks≈engagements×0.08 (always estimated)",
+      excluded,
+      note: "events with live=false have no post up yet and are excluded from spendByService/excluded-adjusted totals; reach=followers sum; impressions/engagements measured from post metrics where available, else impressions≈reach×0.12 and engagements≈reach×avgER; clicks≈engagements×0.08 (always estimated)",
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -711,6 +1005,18 @@ app.post("/api/post-metrics/refresh-all", async (req, res) => {
 app.post("/api/portal/reels/refresh-all", async (req, res) => {
   try {
     res.json(await refreshAllReels());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/portal/reels/backfill-posters — copy the poster frame for every
+// cached reel that predates the poster store. Costs no HikerAPI calls: it reads
+// the signed thumbnail each row already holds. One-shot in practice, but safe
+// to run again — rows that already have a poster are skipped.
+app.post("/api/portal/reels/backfill-posters", async (req, res) => {
+  try {
+    res.json(await backfillPosters());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

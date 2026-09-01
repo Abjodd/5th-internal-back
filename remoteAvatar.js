@@ -1,5 +1,9 @@
 /**
- * remoteAvatar.js — capture a platform profile photo ONCE, as bytes we own.
+ * remoteAvatar.js — capture a platform image ONCE, as bytes we own.
+ *
+ * Two callers, one rule: a creator's profile photo (routes/creators.js,
+ * creatorSync.js) and a reel's poster frame (portalReels.js). Both are handed a
+ * signed CDN link by the platform and both need it to still work next year.
  *
  * ── Why we copy the bytes instead of storing the URL ────────────────────────
  * A platform profile-picture URL is not a permanent address. Instagram's CDN
@@ -28,7 +32,7 @@
  */
 import { MAX_AVATAR_BYTES } from "./avatarStore.js";
 
-const AVATAR_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 const TIMEOUT_MS = 8000;
 
 // Suffix-matched against the hostname, on a dot boundary so that
@@ -54,14 +58,15 @@ export function isAllowedAvatarSource(url) {
 }
 
 /**
- * Download a platform profile photo into { data, contentType } — the exact
+ * Download an image from a platform CDN into { data, contentType } — the exact
  * shape avatarStore puts on a document — or null if it cannot be had.
  *
  * Best-effort by contract: every failure path returns null rather than
- * throwing, because every caller wants "no photo" and not "the save failed".
- * A creator record is worth more than their picture.
+ * throwing, because every caller wants "no image" and not "the save failed".
+ * A creator record is worth more than their picture, and a reel is worth more
+ * than its poster frame.
  */
-export async function fetchRemoteAvatar(url) {
+export async function fetchRemoteImage(url, { maxBytes = MAX_AVATAR_BYTES } = {}) {
   if (!isAllowedAvatarSource(url)) return null;
 
   try {
@@ -77,23 +82,26 @@ export async function fetchRemoteAvatar(url) {
 
     const contentType = String(res.headers.get("content-type") || "")
       .split(";")[0].trim().toLowerCase();
-    if (!AVATAR_TYPES.has(contentType)) return null;
+    if (!IMAGE_TYPES.has(contentType)) return null;
 
     // Declared length first so an oversized image is dropped before it is
     // buffered; the decoded length is checked again below because
     // Content-Length is a claim, not a guarantee.
     const declared = Number(res.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > MAX_AVATAR_BYTES) return null;
+    if (Number.isFinite(declared) && declared > maxBytes) return null;
 
     const data = Buffer.from(await res.arrayBuffer());
-    if (!data.length || data.length > MAX_AVATAR_BYTES) return null;
+    if (!data.length || data.length > maxBytes) return null;
 
     return { data, contentType };
   } catch {
-    // Timeout, DNS failure, connection reset, malformed body — all "no photo".
+    // Timeout, DNS failure, connection reset, malformed body — all "no image".
     return null;
   }
 }
+
+/** A creator's profile photo, at the avatar size cap. */
+export const fetchRemoteAvatar = (url) => fetchRemoteImage(url, { maxBytes: MAX_AVATAR_BYTES });
 
 /**
  * Fetch `url` and stamp it onto an update object, mirroring avatarStore's

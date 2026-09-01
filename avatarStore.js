@@ -95,6 +95,11 @@ export const OMIT_AVATAR = { avatarImage: 0 };
  *   JSON round -> `{ type: "Buffer", data: [...] }`, if a doc ever arrives
  *                that way.
  *
+ * Exported because it is not avatar-specific: portalReels stores reel posters
+ * as the same { data, contentType } pair and its route reads them the same
+ * `.lean()` way, so it inherits the identical trap. One implementation means
+ * the next collection to store bytes cannot rediscover the bug.
+ *
  * Handling all three here is also what lets serveAvatar stay on `.lean()`,
  * which it must: models/Client.js declares a schema path named `init`, and
  * `init` is a reserved Mongoose name (Document.prototype.init drives
@@ -104,7 +109,7 @@ export const OMIT_AVATAR = { avatarImage: 0 };
  * hydration, so the clash has never surfaced — but a non-lean read here would
  * have made brand logos a guaranteed 500.
  */
-function toBuffer(value) {
+export function toBuffer(value) {
   if (!value) return null;
   if (Buffer.isBuffer(value)) return value.length ? value : null;
   // driver Binary
