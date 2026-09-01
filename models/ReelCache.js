@@ -50,6 +50,33 @@ const ReelCacheSchema = new mongoose.Schema(
     // would quietly become a standing daily charge.
     attemptedAt: Date,
     lastError: String,
+
+    // ── The poster frame, as bytes we own ───────────────────────────────────
+    // The one part of a reel that does NOT have to be re-bought, and the
+    // reason the shelf can survive without a nightly refresh at all.
+    //
+    // `reel.thumbnail` is a signed CDN link like every other Instagram URL and
+    // dies ~106h after it is issued. Measured on this very collection: a post
+    // last fetched 157h ago had an image signature 50h expired and was
+    // rendering as a broken tile on the brand's shelf. Refreshing the link on a
+    // schedule treats that as a recurring bill; copying the JPEG once treats it
+    // as a fact. The bytes never expire, so a post fetched once is correct
+    // forever and the archive stops costing anything as it grows.
+    //
+    // Same inline-on-the-document shape as avatarStore.js, for the same
+    // reasons — no join, no orphan cleanup — with the same discipline: every
+    // list read projects these away (OMIT_POSTER) and the image is served from
+    // its own immutably-cached route.
+    poster: { data: Buffer, contentType: String },
+    posterUpdatedAt: Date,
+
+    // The Instagram shortcode, lifted out of `reel` so the poster route can
+    // find a document by it. The collection is keyed by post URL, which is not
+    // something to put in a path segment: the same post is reachable as /p/,
+    // /reel/ and /reels/ (all three are in this collection today), so a URL key
+    // is neither canonical nor URL-safe. The shortcode is both, and it is
+    // already public in the permalink.
+    code: String,
   },
   { strict: false, versionKey: false }
 );
@@ -58,5 +85,9 @@ const ReelCacheSchema = new mongoose.Schema(
 // first". Sorting by fetchedAt lets a capped run always spend its budget on
 // the stalest entries rather than on whatever Mongo returned first.
 ReelCacheSchema.index({ fetchedAt: 1 });
+
+// The poster route's only lookup. Sparse because rows written before the
+// shortcode was stored have no `code`, and they should not all collide on null.
+ReelCacheSchema.index({ code: 1 }, { sparse: true });
 
 export default mongoose.model("ReelCache", ReelCacheSchema, "reel_cache");

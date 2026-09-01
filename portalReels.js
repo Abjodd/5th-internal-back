@@ -59,6 +59,7 @@
 import Campaign from "./models/Campaign.js";
 import ReelCache from "./models/ReelCache.js";
 import { hydrateCampaignCreators } from "./creatorSync.js";
+import { fetchRemoteImage } from "./remoteAvatar.js";
 
 const IG_MEDIA_V2 = "https://api.hikerapi.com/v2/media/by/url";
 const HIKER_TOKEN = process.env.HIKERAPI_TOKEN;
@@ -97,6 +98,16 @@ const MAX_PER_RUN = Number(process.env.PORTAL_REELS_MAX_PER_RUN) || 400;
 const FILL_ON_READ = process.env.PORTAL_REELS_FILL_ON_READ !== "0";
 const MAX_FILL_ON_READ = Number(process.env.PORTAL_REELS_MAX_FILL) || 12;
 
+/* Poster bytes are copied once and kept forever, so the ceiling only has to be
+ * generous enough for a full-resolution Instagram cover (~100-300KB observed).
+ * Anything wildly above that is not a poster frame and is not worth storing. */
+const MAX_POSTER_BYTES = 2 * 1024 * 1024;
+
+/* Pass to any read that does not need the image itself — which is every read
+ * except the poster route. Same discipline as avatarStore's OMIT_AVATAR: bytes
+ * on the document are only affordable if list queries never load them. */
+export const OMIT_POSTER = { poster: 0 };
+
 function log(...args) {
   if (DEBUG) console.log("[portalReels]", ...args);
 }
@@ -114,6 +125,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function pickVideo(versions) {
   if (!Array.isArray(versions) || !versions.length) return null;
   return (versions.find((v) => v.type === 101) || versions[0]).url || null;
+}
+
+/**
+ * When a signed Instagram CDN link stops resolving, as an ISO string.
+ *
+ * Every one of these URLs carries `oe=<hex unix seconds>` — the moment past
+ * which the CDN answers 403 for everyone. Reading it is free and exact, which
+ * beats the alternative the TTL machinery used: assume 24h, refresh on a
+ * schedule, and hope. Measured across this collection the video signature runs
+ * 32-36h and the poster 104-108h, so the guess was never wrong by much — but it
+ * could only be *acted* on by re-buying the media.
+ *
+ * Storing the real expiry instead lets a read decide, at zero cost, whether the
+ * link it holds is still worth handing to a browser. null when the URL carries
+ * no `oe=` (nothing to check, so nothing is assumed).
+ */
+export function signedExpiryOf(url) {
+  const m = /[?&]oe=([0-9a-f]+)/i.exec(String(url || ""));
+  if (!m) return null;
+  const ms = parseInt(m[1], 16) * 1000;
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null;
 }
 
 /** Poster frame. `candidates` is the post's own thumbnail; `first_frame` is a
@@ -181,6 +213,14 @@ export function toReel(m, ctx = {}) {
     // Only reels carry a video: a feed video would otherwise autoplay on hover
     // in a shelf whose hint promises that only reels do.
     video: isReel ? video : null,
+    // The moment the line above stops resolving. Read at serve time so an
+    // expired URL is never handed to a browser — a card with no video renders
+    // as a still, which is correct, where a dead <video> renders as a black
+    // box. See signedExpiryOf and getClientReels.
+    videoExpiresAt: isReel ? signedExpiryOf(video) : null,
+    // Kept even once the bytes are ours: it is what a re-capture would fetch
+    // from, and what the shelf falls back to for a row stored before posters
+    // were captured at all.
     thumbnail,
     likes: count(m.like_count),
     comments: count(m.comment_count),
@@ -210,36 +250,58 @@ export function toReel(m, ctx = {}) {
  * copy a by-product of a call that was already on the bill, which is what
  * takes an active campaign's cost from two calls per post per day to one.
  *
+ * Returns { reel, posterUpdatedAt } — the stored document's own fields, so a
+ * caller that just wrote a row does not have to read it back. Null `reel` means
+ * nothing renderable was stored.
+ *
  * Never throws — a bookkeeping write must not be able to fail the job it rides
- * on. A missed upsert just means the scheduled reels pass picks the post up.
+ * on. A missed upsert just means the post is picked up on a later pass.
  */
 export async function cacheReelFromMedia(postUrl, media, ctx = {}) {
-  if (!postUrl) return null;
+  if (!postUrl) return { reel: null, posterUpdatedAt: null };
   const now = new Date();
   try {
+    // What we already hold, so the poster is copied once rather than on every
+    // refresh. One indexed _id read against a write we were making anyway.
+    const existing = await ReelCache.findById(postUrl, { posterUpdatedAt: 1 }).lean();
+
     if (!media) {
       // Record the attempt so a dead post backs off, but leave `reel` and
       // `fetchedAt` untouched: whatever we last managed to read stays on the
-      // shelf. The video signature outlives the TTL by ~8h, so a stale hit is
-      // still likely to play — and a reel that vanishes on a bad upstream day
-      // reads to the brand as us having lost their post.
+      // shelf. A reel that vanishes on a bad upstream day reads to the brand as
+      // us having lost their post — and now that the poster is bytes we own,
+      // the card keeps rendering correctly regardless.
       await ReelCache.updateOne(
         { _id: postUrl },
         { $set: { attemptedAt: now, lastError: "no media in response" } },
         { upsert: true },
       );
-      return null;
+      return { reel: null, posterUpdatedAt: existing?.posterUpdatedAt ?? null };
     }
+
     const reel = toReel(media, { ...ctx, postUrl });
-    await ReelCache.updateOne(
-      { _id: postUrl },
-      { $set: { reel, fetchedAt: now, attemptedAt: now, lastError: null } },
-      { upsert: true },
-    );
-    return reel;
+    const set = { reel, fetchedAt: now, attemptedAt: now, lastError: null, code: reel?.code ?? null };
+
+    // Copy the poster frame the first time we see this post, and only then.
+    // The image does not change, so re-fetching it on later passes would be
+    // bandwidth spent to store the same bytes again. A failure here is not a
+    // failure of the write: the signed `reel.thumbnail` is still on the
+    // document and still serves the card until the next pass tries again.
+    let posterUpdatedAt = existing?.posterUpdatedAt ?? null;
+    if (!posterUpdatedAt && reel?.thumbnail) {
+      const poster = await fetchRemoteImage(reel.thumbnail, { maxBytes: MAX_POSTER_BYTES });
+      if (poster) {
+        set.poster = poster;
+        set.posterUpdatedAt = now;
+        posterUpdatedAt = now;
+      }
+    }
+
+    await ReelCache.updateOne({ _id: postUrl }, { $set: set }, { upsert: true });
+    return { reel, posterUpdatedAt };
   } catch (e) {
     log(`cache write ${postUrl}: ${e.message}`);
-    return null;
+    return { reel: null, posterUpdatedAt: null };
   }
 }
 
@@ -276,6 +338,35 @@ async function fetchAndCache(post) {
 }
 
 /**
+ * The Instagram posts on one roster, deduped against `seen`.
+ *
+ * Split out of collectPosts because the write path needs the same walk over a
+ * creators[] array it is about to save, without a campaigns query to do it —
+ * see warmReels(). One reading of the roster shape means the two paths cannot
+ * disagree about which links count as posts.
+ */
+function postsOfCreators(creators, campaignName = null, seen = new Set()) {
+  const posts = [];
+  for (const cr of creators || []) {
+    const live = cr.live || {};
+    const urls = Array.isArray(live.postUrls)
+      ? live.postUrls
+      : live.postUrl
+        ? [live.postUrl]
+        : [];
+    for (const raw of urls) {
+      const url = String(raw || "").trim();
+      // Platform is the roster's own label and is sometimes unset on older
+      // rows, so the link itself is the authority on what this is.
+      if (!/instagram\.com/i.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      posts.push({ postUrl: url, handle: cr.handle || null, campaign: campaignName });
+    }
+  }
+  return posts;
+}
+
+/**
  * Every Instagram post the given client has live, deduped, with the handle and
  * campaign name each came from. Pass no client to sweep every brand — that is
  * what the scheduled refresh does.
@@ -293,25 +384,60 @@ export async function collectPosts(clientName = null) {
 
   const seen = new Set();
   const posts = [];
-  for (const c of campaigns) {
-    for (const cr of c.creators || []) {
-      const live = cr.live || {};
-      const urls = Array.isArray(live.postUrls)
-        ? live.postUrls
-        : live.postUrl
-          ? [live.postUrl]
-          : [];
-      for (const raw of urls) {
-        const url = String(raw || "").trim();
-        // Platform is the roster's own label and is sometimes unset on older
-        // rows, so the link itself is the authority on what this is.
-        if (!/instagram\.com/i.test(url) || seen.has(url)) continue;
-        seen.add(url);
-        posts.push({ postUrl: url, handle: cr.handle || null, campaign: c.name || null });
-      }
-    }
-  }
+  for (const c of campaigns) posts.push(...postsOfCreators(c.creators, c.name || null, seen));
   return posts;
+}
+
+/**
+ * Fetch and store any post on this roster the cache has never seen.
+ *
+ * Called from the campaign write path (PATCH /api/campaigns/:id), which is the
+ * moment a post URL first exists in the system — someone on the internal side
+ * has just pasted the permalink of a reel that went live.
+ *
+ * ── Why the write path is the right place ───────────────────────────────────
+ * Fetching here does not change what a post costs: it is one call either way,
+ * once, for the lifetime of the post. What it changes is WHEN and WHO. Before,
+ * the first fetch happened on a brand's own page load (FILL_ON_READ) or up to
+ * 24h later on a scheduled pass — so a client opening the portal minutes after
+ * delivery either paid the latency of a third-party call inside their request,
+ * or saw a shelf that was silently missing the post they were told about.
+ *
+ * Doing it at write time means the portal's read path can be strictly
+ * database-only (PORTAL_REELS_FILL_ON_READ=0) while a new reel still appears
+ * immediately.
+ *
+ * Fire-and-forget by design — never awaited by the route, never throws. A
+ * campaign save must not fail, or wait, because Instagram is slow. Idempotent
+ * and self-limiting: a row exists after the first attempt whether it succeeded
+ * or not, so a post is never fetched here twice.
+ */
+export async function warmReels(creators, campaignName = null) {
+  try {
+    const posts = postsOfCreators(creators, campaignName);
+    if (!posts.length) return { posts: 0, fetched: 0 };
+
+    const known = await ReelCache.find({ _id: { $in: posts.map((p) => p.postUrl) } })
+      .select({ _id: 1 })
+      .lean();
+    const seen = new Set(known.map((r) => r._id));
+
+    // Capped for the same reason the read-path fill was: one save should not be
+    // able to turn into an unbounded run of paid calls. Anything over the cap
+    // is a bulk import, which the scheduled pass is the right place to absorb.
+    const batch = posts.filter((p) => !seen.has(p.postUrl)).slice(0, MAX_FILL_ON_READ);
+    if (!batch.length) return { posts: posts.length, fetched: 0 };
+
+    log(`warm ${campaignName || "campaign"}: ${batch.length} new post(s)`);
+    for (const post of batch) {
+      await fetchAndCache(post);
+      await sleep(GAP_MS);
+    }
+    return { posts: posts.length, fetched: batch.length };
+  } catch (e) {
+    log(`warm failed: ${e.message}`);
+    return { posts: 0, fetched: 0 };
+  }
 }
 
 /**
@@ -335,29 +461,55 @@ export async function getClientReels(clientName) {
   if (!posts.length) return [];
 
   const urls = posts.map((p) => p.postUrl);
-  const rows = await ReelCache.find({ _id: { $in: urls } }).lean();
+  // Without OMIT_POSTER this would pull every stored JPEG into memory to build
+  // a JSON payload that does not contain them — the whole point of serving the
+  // image from its own route. Same rule as avatarStore's list projections.
+  const rows = await ReelCache.find({ _id: { $in: urls } }).select(OMIT_POSTER).lean();
   const byUrl = new Map(rows.map((r) => [r._id, r]));
 
   // First sight only: a post that went live since the last scheduled pass has
   // no row at all. See FILL_ON_READ — this is bounded, persisted (so it cannot
-  // repeat for the same post), and skipped entirely when disabled.
+  // repeat for the same post), and skipped entirely when disabled. With
+  // warmReels() on the campaign write path this should now find nothing, and
+  // setting PORTAL_REELS_FILL_ON_READ=0 makes that guarantee rather than a
+  // hope.
   const unseen = FILL_ON_READ ? posts.filter((p) => !byUrl.has(p.postUrl)) : [];
   if (unseen.length) {
     const batch = unseen.slice(0, MAX_FILL_ON_READ);
     log(`${clientName}: ${unseen.length} post(s) never cached, filling ${batch.length}`);
     for (const p of batch) {
-      const reel = await fetchAndCache(p);
-      byUrl.set(p.postUrl, { _id: p.postUrl, reel });
+      const { reel, posterUpdatedAt } = await fetchAndCache(p);
+      byUrl.set(p.postUrl, { _id: p.postUrl, reel, posterUpdatedAt });
       await sleep(GAP_MS);
     }
   }
 
+  const now = Date.now();
   const reels = [];
   for (const p of posts) {
-    const cached = byUrl.get(p.postUrl)?.reel;
+    const row = byUrl.get(p.postUrl);
+    const cached = row?.reel;
     if (!cached) continue;
+
+    // A signed video URL past its `oe=` is a 403 waiting to happen, and a
+    // <video> pointed at one renders a black box rather than falling back. The
+    // shelf already treats "no video" as "this is a still", so withholding the
+    // dead link is what makes an archived reel degrade cleanly instead of
+    // breaking. The poster is ours and does not expire, so the card is intact
+    // either way — only the hover-play is lost.
+    const playable = cached.videoExpiresAt
+      ? Date.parse(cached.videoExpiresAt) > now
+      : !!cached.video;
+
     reels.push({
       ...cached,
+      video: playable ? cached.video : null,
+      // Whether the portal should read the poster from our own route instead of
+      // the signed `thumbnail`. Mirrors `hasAvatar` on the creator routes, and
+      // for the same reason: the bytes never travel in a list payload, so the
+      // client needs a witness that they exist plus a version to cache-bust on.
+      hasPoster: !!row.posterUpdatedAt,
+      posterUpdatedAt: row.posterUpdatedAt ?? null,
       // Reattached from the live campaign rather than read from the cache, so
       // a renamed campaign is correct on the shelf immediately. Same for the
       // handle fallback, which only applies when the media carried no username.
@@ -369,6 +521,67 @@ export async function getClientReels(clientName) {
   reels.sort((a, b) => (b.takenAt || "").localeCompare(a.takenAt || ""));
   log(`${clientName}: ${posts.length} post(s) -> ${reels.length} reel(s) (0 API calls)`);
   return reels;
+}
+
+/**
+ * The stored poster for one shortcode, or null. Feeds GET
+ * /api/portal/reels/:code/poster — the only read that wants the bytes.
+ */
+export async function getReelPoster(code) {
+  const row = await ReelCache.findOne({ code }, { poster: 1 }).lean();
+  return row?.poster ?? null;
+}
+
+/**
+ * Copy the poster frame for every cached reel that has not got one yet.
+ *
+ * Costs NOTHING at HikerAPI. Each row already holds the signed `thumbnail` URL
+ * from whenever it was last fetched, and the image signature runs ~106h — far
+ * longer than the video's ~32h — so a row refreshed any time in the last four
+ * days can have its bytes copied straight off that link. Only a row whose
+ * thumbnail signature has also lapsed is beyond reach here; it is picked up by
+ * the next ordinary fetch of that post.
+ *
+ * Exists because the posters and the `code` index arrived after the collection
+ * did. Without it every row cached before this change keeps serving the signed
+ * link, on the same expiry clock as before, and the change only helps posts
+ * fetched from here on. Safe to run repeatedly: rows that already have a poster
+ * are not queried, so a second run does nothing.
+ */
+export async function backfillPosters({ log: out = console.log } = {}) {
+  const started = Date.now();
+  const rows = await ReelCache.find({ posterUpdatedAt: { $in: [null, undefined] } })
+    .select({ reel: 1 })
+    .lean();
+
+  let ok = 0, failed = 0, skipped = 0;
+  for (const row of rows) {
+    const thumbnail = row.reel?.thumbnail;
+    // `code` is backfilled alongside, and unconditionally: it is what the
+    // poster route looks a document up by, and it was never stored at the top
+    // level before this change.
+    const set = { code: row.reel?.code ?? null };
+
+    if (!thumbnail) {
+      skipped++;
+    } else {
+      const poster = await fetchRemoteImage(thumbnail, { maxBytes: MAX_POSTER_BYTES });
+      if (poster) {
+        set.poster = poster;
+        set.posterUpdatedAt = new Date();
+        ok++;
+      } else {
+        // Almost always an expired image signature — see signedExpiryOf. Left
+        // for the next fetch of this post to supply a fresh link.
+        failed++;
+      }
+    }
+    await ReelCache.updateOne({ _id: row._id }, { $set: set });
+  }
+
+  const summary = { rows: rows.length, ok, failed, skipped, apiCalls: 0, ms: Date.now() - started };
+  out(`[portalReels] backfillPosters ${JSON.stringify(summary)}`);
+  return summary;
 }
 
 /**
@@ -413,7 +626,7 @@ export async function refreshAllReels({ log: out = console.log } = {}) {
   const batch = due.slice(0, MAX_PER_RUN);
   let ok = 0, failed = 0;
   for (const p of batch) {
-    const reel = await fetchAndCache(p);
+    const { reel } = await fetchAndCache(p);
     if (reel === null) failed++; else ok++;
     await sleep(GAP_MS);
   }
