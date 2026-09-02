@@ -269,11 +269,8 @@ const CAMPAIGN_PRIVATE = [
   // (a staff teamId), the denormalized creator index, and the soft-delete
   // bookkeeping that every query already filters on.
   "createdBy", "creatorIds", "deleted", "deletedAt",
-  // The RATE the agency fee was agreed at. The fee's rupee amount goes to the
-  // client — it is a line on their own budget breakdown — but the percentage is
-  // the term we negotiate from, and it is read against the base budget, which
-  // is not a number the portal is given. Sending it would hand the brand the
-  // creator-pool split by subtraction on every campaign.
+  // The fee's AMOUNT is the brand's to see; the rate it was agreed at is not —
+  // read against the base budget it gives away the creator-pool split.
   "agencyFeePct",
 ];
 
@@ -315,20 +312,13 @@ const CREATOR_PUBLIC = [
   "brandDecision",
 ];
 
-// The ONE per-creator money figure a brand may read, and it is deliberately not
-// on the allowlist above — it is RENAMED on the way out.
+// Renamed on the way out, which is why it is not in the allowlist above: a
+// roster carries `cost` (what we pay — never leaves the building, it is half
+// the margin) and `clientCost` (what the brand is charged). The portal knows
+// one figure and calls it `cost`, so clientCost → cost.
 //
-// Internally a roster entry carries two numbers: `cost`, what we pay the
-// creator, and `clientCost`, what the brand is charged for them. `cost` must
-// never leave the building — it is half of the margin — so it is not in
-// CREATOR_PUBLIC and never will be. The portal, meanwhile, has always spoken of
-// one per-creator figure and calls it `cost` (5th-avenue-client-front), so the
-// mapping is: internal clientCost → portal cost. Anything reading a creator's
-// `cost` on the portal side is reading what the client was billed.
-//
-// Absent stays absent — no key at all, rather than 0. A creator nobody has
-// priced for the client yet drops out of the portal's budget breakdown instead
-// of appearing in it as one given away free.
+// Unpriced stays absent rather than 0 — the brand's breakdown leaves that
+// creator out instead of listing them as free.
 const withClientCost = (safe, cr) => {
   const v = cr?.clientCost;
   if (v == null || v === "") return safe;
@@ -347,6 +337,19 @@ const withRosterRef = (safe, cr) => {
   const id = cr?._id;
   return id ? { ...safe, ref: String(id) } : safe;
 };
+
+// Campaigns a brand's NUMBERS are drawn from — not which campaigns they see.
+// They see all of them, at every phase, because planned work belongs on their
+// board. But a campaign still being briefed, shortlisted or produced has a
+// budget that can still move, so counting it puts the brand's headline at the
+// mercy of an internal stage change: one such campaign carried Pronto's total
+// from ₹1.5L to ₹4.8L.
+//
+// Mirrors countsInMetrics in the portal (lib/portalMetrics.js), which is keyed
+// on the same two phases. Kept as stage ids here because Mongo filters on what
+// is stored; `live` and `completed` are the phases these map to.
+const LIVE_STAGES = ["invoice_raised", "payment_done", "live", "creator_paid", "reporting", "completed"];
+const METRIC_CAMPAIGNS = { deleted: { $ne: true }, stage: { $in: LIVE_STAGES } };
 
 app.get("/api/portal/campaigns", async (req, res) => {
   try {
@@ -876,7 +879,7 @@ app.get("/api/portal/analytics", async (req, res) => {
     const from = req.query.from ? new Date(req.query.from) : new Date(new Date().getFullYear(), 0, 1);
     const to   = req.query.to   ? new Date(req.query.to)   : new Date();
 
-    const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
+    const campaigns = await Campaign.find({ client, ...METRIC_CAMPAIGNS }).lean();
     // Rejoins each roster entry with its profile in the creators directory.
     // Without this, followers/avgER are undefined and every metric below is 0.
     await hydrateCampaignCreators(campaigns);
