@@ -256,7 +256,7 @@ app.delete("/api/campaigns/:id", async (req, res) => {
 });
 
 // ── Client Portal (read-only) ────────────────────────────────────────────────
-// GET /api/portal/campaigns?client=NAME — one client's campaigns, with
+// GET /api/portal/campaigns?brand=BRANDID — one brand's campaigns, with
 // everything internal stripped before it leaves the building.
 //
 // Campaign fields are a denylist: money the client shouldn't see (creator
@@ -338,24 +338,62 @@ const withRosterRef = (safe, cr) => {
   return id ? { ...safe, ref: String(id) } : safe;
 };
 
-// Campaigns a brand's NUMBERS are drawn from — not which campaigns they see.
-// They see all of them, at every phase, because planned work belongs on their
-// board. But a campaign still being briefed, shortlisted or produced has a
-// budget that can still move, so counting it puts the brand's headline at the
-// mercy of an internal stage change: one such campaign carried Pronto's total
-// from ₹1.5L to ₹4.8L.
+// ── Whose campaigns ─────────────────────────────────────────────────────────
+// Portal reads are scoped by brandId, the stable id every campaign carries.
+// They used to be scoped by `Campaign.client`, a copy of the brand's display
+// name — which is left empty when a brand is created alongside its first
+// campaign, and goes stale when a brand is renamed. Either way the brand's
+// portal silently showed nothing at all.
 //
-// Mirrors countsInMetrics in the portal (lib/portalMetrics.js), which is keyed
-// on the same two phases. Kept as stage ids here because Mongo filters on what
-// is stored; `live` and `completed` are the phases these map to.
-const LIVE_STAGES = ["invoice_raised", "payment_done", "live", "creator_paid", "reporting", "completed"];
-const METRIC_CAMPAIGNS = { deleted: { $ne: true }, stage: { $in: LIVE_STAGES } };
+// Takes ?brand=<brandId> (what the portal sends) or ?client=<name> (older
+// callers). Null when no such brand exists.
+async function resolveBrandScope({ brand, client } = {}) {
+  const id = String(brand || "").trim();
+  const name = String(client || "").trim();
+  const doc = id ? await Client.findById(id, { name: 1 }).lean()
+    : name ? await Client.findOne({ name }, { name: 1 }).lean()
+    : null;
+  return doc ? { id: String(doc._id), name: doc.name } : null;
+}
+
+/** Answers the request and returns false when the brand doesn't resolve. */
+function requireBrandScope(res, scope) {
+  if (scope) return true;
+  res.status(400).json({ error: "a known brand or client query param is required" });
+  return false;
+}
+
+// ── What counts ─────────────────────────────────────────────────────────────
+// Which campaigns a brand's NUMBERS come from. Not which they SEE — they see
+// all of them, because planned work belongs on their board. But a budget that
+// is still being arranged must not move a figure they are asked to trust.
+//
+// Finance and delivery are two separate tracks, so a campaign can have creators
+// posting while its invoice is still out. Either track can admit it:
+//   · finance reached invoice_raised or later, or
+//   · a post is live AND the money is real (budget set, someone priced).
+//
+// That second guard is what keeps out a campaign like BAU — eight posts live,
+// nobody priced — which would otherwise render a bill of ₹0.
+//
+// Mirrored by countsInMetrics in the portal's lib/portalMetrics.js. Change both
+// or the two apps disagree about the same campaign.
+const LIVE_STAGES = new Set(["invoice_raised", "payment_done", "live", "creator_paid", "reporting", "completed"]);
+// Either field means the post is up; postUrls is the array, postUrl the first
+// link kept for back-compat.
+const isCreatorLive = (cr) => !!(cr?.live?.postUrls?.length || cr?.live?.postUrl);
+// clientCost is what the brand is charged; `cost` is what we pay the creator
+// and never leaves the building.
+const isPriced = (c) =>
+  Number(c?.budget) > 0 && (c?.creators || []).some((cr) => Number(cr?.clientCost) > 0);
+const countsInMetrics = (c) =>
+  LIVE_STAGES.has(c?.stage) || ((c?.creators || []).some(isCreatorLive) && isPriced(c));
 
 app.get("/api/portal/campaigns", async (req, res) => {
   try {
-    const client = req.query.client;
-    if (!client) return res.status(400).json({ error: "client query param is required" });
-    const campaigns = await Campaign.find({ client, deleted: { $ne: true } }).lean();
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const campaigns = await Campaign.find({ brandId: scope.id, deleted: { $ne: true } }).lean();
     await hydrateCampaignCreators(campaigns);
     res.json(
       campaigns.map(({ _id, ...c }) => {
@@ -406,7 +444,7 @@ const DECIDABLE = new Set(["suggested", ...Object.values(BRAND_DECISION)]);
 
 /**
  * Append one note and hand back the whole thread.
- * `match` is the caller's own scoping — the portal adds the client name to it,
+ * `match` is the caller's own scoping — the portal adds the brandId to it,
  * the internal route doesn't need to.
  */
 async function appendAssetComment(match, ref, asset, { body, role, author, accountId = null }) {
@@ -447,19 +485,19 @@ function readComment(req, res) {
 // POST /api/portal/campaigns/:id/creators/:ref/:asset/comments — the brand's note.
 //
 // The portal's only write against campaign data. Scoped like every other
-// /api/portal route: matched on the campaign id AND the client name, so a
+// /api/portal route: matched on the campaign id AND the brandId, so a
 // guessed id from another brand matches nothing. `role` is set here and never
 // read from the request — anything arriving on this route is a client note by
 // definition.
 app.post("/api/portal/campaigns/:id/creators/:ref/:asset/comments", async (req, res) => {
   try {
-    const client = String(req.body?.client || "").trim();
-    if (!client) return res.status(400).json({ error: "client is required" });
+    const scope = await resolveBrandScope(req.body);
+    if (!requireBrandScope(res, scope)) return;
     const body = readComment(req, res);
     if (!body) return;
 
     const result = await appendAssetComment(
-      { _id: req.params.id, client, deleted: { $ne: true } },
+      { _id: req.params.id, brandId: scope.id, deleted: { $ne: true } },
       String(req.params.ref),
       req.params.asset,
       {
@@ -503,16 +541,16 @@ app.post("/api/campaigns/:id/creators/:ref/:asset/comments", async (req, res) =>
 // Writes the roster row's own `status`, so the answer lands where the internal
 // Creators tab already reads from and nothing has to be reconciled later. The
 // audit of who said it and when goes on `brandDecision` beside it. Scoped on
-// campaign id AND client name like every /api/portal route.
+// campaign id AND brandId like every /api/portal route.
 app.post("/api/portal/campaigns/:id/creators/:ref/decision", async (req, res) => {
   try {
-    const client = String(req.body?.client || "").trim();
-    if (!client) return res.status(400).json({ error: "client is required" });
+    const scope = await resolveBrandScope(req.body);
+    if (!requireBrandScope(res, scope)) return;
     const decision = String(req.body?.decision || "").trim();
     const status = BRAND_DECISION[decision];
     if (!status) return res.status(400).json({ error: "decision must be approve or reject" });
 
-    const match = { _id: req.params.id, client, deleted: { $ne: true } };
+    const match = { _id: req.params.id, brandId: scope.id, deleted: { $ne: true } };
     const ref = String(req.params.ref);
     const campaign = await Campaign.findOne(match, { creators: 1 }).lean();
     const row = (campaign?.creators || []).find((cr) => String(cr?._id) === ref);
@@ -544,7 +582,7 @@ app.post("/api/portal/campaigns/:id/creators/:ref/decision", async (req, res) =>
   }
 });
 
-// GET /api/portal/client?client=NAME — the brand's own company record, for the
+// GET /api/portal/client?brand=BRANDID — the brand's own company record, for the
 // portal's Settings → Company panel.
 //
 // An ALLOWLIST for the same reason CREATOR_PUBLIC above is one: Client is
@@ -563,9 +601,9 @@ const CLIENT_PROFILE_PUBLIC = [
 
 app.get("/api/portal/client", async (req, res) => {
   try {
-    const client = req.query.client;
-    if (!client) return res.status(400).json({ error: "client query param is required" });
-    const doc = await Client.findOne({ name: client }, OMIT_AVATAR).lean();
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const doc = await Client.findById(scope.id, OMIT_AVATAR).lean();
     if (!doc) return res.status(404).json({ error: "not found" });
 
     const pick = (src, keys) =>
@@ -774,14 +812,8 @@ function parseFollowers(raw) {
   return n * (mp[2] === "M" ? 1e6 : mp[2] === "K" ? 1e3 : 1);
 }
 
-// Is this creator's post actually up? `live.postUrls` is the real array;
-// `postUrl` is the mirrored first link kept for back-compat, so either one
-// being present is the fact. Mirrors isCreatorLive() in the portal's
-// lib/portalMetrics.js — the two apps must agree on what "live" means.
-const isCreatorLive = (cr) => !!(cr?.live?.postUrls?.length || cr?.live?.postUrl);
-
 // ── Client Portal Analytics ─────────────────────────────────────────────────
-// GET /api/portal/reels?client=NAME — the brand's live campaign posts, with
+// GET /api/portal/reels?brand=BRANDID — the brand's live campaign posts, with
 // the video, poster and caption Instagram holds, for the portal's Reels shelf.
 //
 // No allowlist pass here, unlike the two routes above: portalReels.js builds
@@ -795,9 +827,9 @@ const isCreatorLive = (cr) => !!(cr?.live?.postUrls?.length || cr?.live?.postUrl
 // whole shelf; see the header of portalReels.js.
 app.get("/api/portal/reels", async (req, res) => {
   try {
-    const client = req.query.client;
-    if (!client) return res.status(400).json({ error: "client query param is required" });
-    res.json({ reels: await getClientReels(client) });
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    res.json({ reels: await getClientReels(scope) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -829,7 +861,7 @@ app.get("/api/portal/reels/:code/poster", async (req, res) => {
   }
 });
 
-// GET /api/portal/analytics?client=NAME&from=ISO&to=ISO
+// GET /api/portal/analytics?brand=BRANDID&from=ISO&to=ISO
 // Returns one dated event per campaign in the period (spend/reach/engagement
 // metrics, dated by campaign start) plus a spend-by-service split. The portal
 // buckets events into daily/weekly/monthly series client-side (see
@@ -873,13 +905,17 @@ app.get("/api/portal/reels/:code/poster", async (req, res) => {
 // same rule — the portal can't re-derive a split it is handed as a map.
 app.get("/api/portal/analytics", async (req, res) => {
   try {
-    const client = req.query.client;
-    if (!client) return res.status(400).json({ error: "client query param is required" });
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
 
     const from = req.query.from ? new Date(req.query.from) : new Date(new Date().getFullYear(), 0, 1);
     const to   = req.query.to   ? new Date(req.query.to)   : new Date();
 
-    const campaigns = await Campaign.find({ client, ...METRIC_CAMPAIGNS }).lean();
+    // Filtered here, not in the query: one predicate shared with the portal
+    // beats the same rule written twice in two languages. It reads only fields
+    // on the campaign itself, so it runs before the creator join, not after.
+    const campaigns = (await Campaign.find({ brandId: scope.id, deleted: { $ne: true } }).lean())
+      .filter(countsInMetrics);
     // Rejoins each roster entry with its profile in the creators directory.
     // Without this, followers/avgER are undefined and every metric below is 0.
     await hydrateCampaignCreators(campaigns);

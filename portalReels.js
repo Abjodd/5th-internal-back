@@ -367,13 +367,17 @@ function postsOfCreators(creators, campaignName = null, seen = new Set()) {
 }
 
 /**
- * Every Instagram post the given client has live, deduped, with the handle and
- * campaign name each came from. Pass no client to sweep every brand — that is
+ * Every Instagram post the given brand has live, deduped, with the handle and
+ * campaign name each came from. Pass no brandId to sweep every brand — that is
  * what the scheduled refresh does.
+ *
+ * Keyed on brandId, not the client name it used to take: that name is blank on
+ * a brand created alongside its first campaign, which left the Assets shelf
+ * permanently empty. See resolveBrandScope in server.js.
  */
-export async function collectPosts(clientName = null) {
+export async function collectPosts(brandId = null) {
   const filter = { deleted: { $ne: true } };
-  if (clientName) filter.client = clientName;
+  if (brandId) filter.brandId = brandId;
 
   const campaigns = await Campaign.find(filter).lean();
   // Roster rows carry no `handle` of their own since creator profiles moved to
@@ -456,8 +460,9 @@ export async function warmReels(creators, campaignName = null) {
  * thumbnail, drop out silently — a partial shelf is the right failure here.
  * The page's own empty state covers the case where nothing survives.
  */
-export async function getClientReels(clientName) {
-  const posts = await collectPosts(clientName);
+export async function getClientReels(scope) {
+  const clientName = scope?.name || scope?.id || "brand"; // for the log lines only
+  const posts = await collectPosts(scope?.id);
   if (!posts.length) return [];
 
   const urls = posts.map((p) => p.postUrl);
