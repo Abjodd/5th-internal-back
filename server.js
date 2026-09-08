@@ -1,5 +1,7 @@
 import express from "express";
 import cors from "cors";
+// Only for the health route's DB ping — every query here goes through a model.
+import mongoose from "mongoose";
 import { connectDB } from "./db.js";
 import Campaign from "./models/Campaign.js";
 import Invoice from "./models/Invoice.js";
@@ -159,6 +161,14 @@ app.get("/api/campaigns", async (req, res) => {
 app.get("/api/campaigns/brand-scope", async (req, res) => {
   try {
     const teamId = String(req.query.teamId || "").trim();
+    // ?all=1 — every brand that has at least one live campaign, whoever owns
+    // it. A different question from the teamId scope below ("brands I can
+    // reach"), and the app shell asks both: a company-wide role can reach every
+    // brand but should still not be offered a filter for one with nothing to
+    // show. Same `distinct`, no ownership clause.
+    if (req.query.all === "1") {
+      return res.json((await Campaign.distinct("brandId", { deleted: { $ne: true } })).filter(Boolean));
+    }
     // No teamId means nothing is assignable to this user, which is an empty
     // scope — NOT "show everything". Company-wide roles never call this: the
     // client skips the request entirely (see reachableBrandIds).
@@ -238,17 +248,46 @@ app.patch("/api/campaigns/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/campaigns/:id?actor=NAME — soft delete: the doc stays in Mongo
-// with deleted:true so it can be restored by hand, but every list query hides
-// it. The deletion is appended to the campaign's timeline as the audit trail.
+// DELETE /api/campaigns/:id?actor=NAME[&purge=1] — two different acts.
+//
+// Default (archive): the doc stays in Mongo with deleted:true, so every list
+// query hides it but it can be restored by hand. The deletion is appended to
+// the campaign's timeline as the audit trail.
+//
+// ?purge=1: the document is removed. There is no undo and no timeline to
+// append to afterwards, which is why the two are separate parameters rather
+// than one "delete" that quietly does whichever.
+//
+// Auto-generated creator expenses go with it. They are derived from the
+// roster (creatorExpensePlan in 5th-internal-front lib/campaign.js) and keyed
+// EXP-<campaignId>-<rosterRowId>, so once the campaign is gone they are
+// unreachable rows that still count toward Billing's totals.
+//
+// The OTHER billing collections (invoices, client POs, vendor POs, quotes) are
+// cascaded by the caller, which already does exactly that for both modes — see
+// onDeleteCampaign in 5th-internal-front. This deleteMany is the safety net for
+// callers that don't, and is a no-op when they have: an orphan expense is the
+// one row Billing does not hide on its own, so it would keep inflating
+// committed spend and the approval queue forever.
 app.delete("/api/campaigns/:id", async (req, res) => {
   try {
+    const id = req.params.id;
     const actor = req.query.actor || "Unknown";
+
+    if (req.query.purge === "1") {
+      const campaign = await Campaign.findByIdAndDelete(id).lean();
+      if (!campaign) return res.status(404).json({ error: "not found" });
+      const { deletedCount } = await Expense.deleteMany({ campaign: id });
+      console.log(`[campaigns] purged ${id} by ${actor} (+${deletedCount} expenses)`);
+      return res.json({ purged: true, expensesDeleted: deletedCount });
+    }
+
     const date = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-    await Campaign.findByIdAndUpdate(req.params.id, {
+    const archived = await Campaign.findByIdAndUpdate(id, {
       $set: { deleted: true, deletedAt: new Date() },
-      $push: { timeline: { date, event: "Campaign deleted", actor } },
-    });
+      $push: { timeline: { date, event: "Campaign archived", actor } },
+    }).lean();
+    if (!archived) return res.status(404).json({ error: "not found" });
     res.status(204).end();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1061,7 +1100,25 @@ app.post("/api/portal/reels/backfill-posters", async (req, res) => {
   }
 });
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+// GET /api/health — liveness, and the wake-up call the sign-in pages make.
+//
+// It pings Mongo rather than answering from memory alone. Both frontends hit
+// this the moment their login page mounts, and the point is to pay the cold
+// start while someone is typing their password instead of after they submit:
+// on a host that sleeps an idle service, the first request also has to spin the
+// process up and open a fresh connection pool. An `{ok:true}` that never
+// touched the database would warm the process and leave the slow half undone.
+//
+// `db:false` is still a 200. This route says the service is reachable; a failed
+// ping is information for the caller, not a reason to look down.
+app.get("/api/health", async (req, res) => {
+  let db = false;
+  try {
+    await mongoose.connection.db.admin().command({ ping: 1 });
+    db = true;
+  } catch {}
+  res.json({ ok: true, db });
+});
 
 const PORT = process.env.PORT || 4000;
 
