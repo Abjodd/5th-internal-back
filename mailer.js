@@ -37,10 +37,10 @@ function shell({ heading, intro, rows, highlight, ctaUrl, ctaLabel }) {
   <div style="background:#F5F5F7;padding:32px 16px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
     <div style="max-width:540px;margin:0 auto;background:#FFFFFF;border-radius:14px;overflow:hidden;border:1px solid #E5E5EA">
 
-      <!-- Header — 5th Avenue mark -->
+      <!-- Header — FIFTH Avenue mark -->
       <div style="padding:28px 32px;background:#1D1D1F;">
         <div style="font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:21px;color:#FFFFFF;letter-spacing:-0.01em">
-          5th Avenue<span style="font-size:11px;vertical-align:super;font-style:normal;opacity:0.6">™</span>
+          FIFTH Avenue<span style="font-size:11px;vertical-align:super;font-style:normal;opacity:0.6">™</span>
         </div>
         <div style="font-size:11px;color:rgba(255,255,255,0.55);margin-top:2px;letter-spacing:0.02em">Internal Platform</div>
       </div>
@@ -70,7 +70,7 @@ function shell({ heading, intro, rows, highlight, ctaUrl, ctaLabel }) {
 
       <!-- Footer -->
       <div style="padding:16px 32px;background:#FAFAFA;border-top:1px solid #F0F0F2">
-        <p style="margin:0;font-size:10.5px;color:#ACACB0">5th Avenue™ — Internal Platform. Automated notification, no reply needed.</p>
+        <p style="margin:0;font-size:10.5px;color:#ACACB0">FIFTH Avenue™ — Internal Platform. Automated notification, no reply needed.</p>
       </div>
     </div>
   </div>`;
