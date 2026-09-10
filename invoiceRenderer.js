@@ -16,9 +16,8 @@ const AGENCY = { name: "5th Avenue" };
 const fmt = (n) => "Rs. " + (n || 0).toLocaleString("en-IN");
 
 // ── TEXT ENCODING ────────────────────────────────────────────────────────────
-// Punctuation that real names and campaign titles arrive with — phone keyboards
-// and word processors produce curly quotes and long dashes — but WinAnsi's
-// Latin-1 range has no room for. Substituted rather than dropped, so "O'Brien"
+// Punctuation phones and word processors produce — curly quotes, long dashes —
+// that WinAnsi can't encode. Folded to ASCII rather than dropped, so "O'Brien"
 // pasted from a phone stays "O'Brien" instead of becoming "OBrien".
 const SUBSTITUTIONS = {
   "\u2018": "'", "\u2019": "'", "\u201A": ",", "\u201B": "'",
@@ -28,34 +27,24 @@ const SUBSTITUTIONS = {
 };
 
 /**
- * Everything drawn on this page, made safe for the font actually drawing it.
+ * Makes text safe for pdfkit's built-in fonts, which are WinAnsi (cp1252).
  *
- * pdfkit's built-in fonts are WinAnsi (cp1252). A character outside it is not
- * refused — it is silently written as different, wrong bytes. "Shoaib🦇", a real
- * creator's display name, printed on a tax invoice as "ShoaibØ>Ý"; the em dash
- * in "Influencer Marketing Services — Campaign" vanished entirely, leaving a
- * double space nobody noticed.
+ * A character WinAnsi can't encode is not rejected — pdfkit silently writes
+ * wrong bytes. The creator name "Shoaib🦇" printed on a tax invoice as
+ * "ShoaibØ>Ý".
  *
- * So characters the encoding can represent pass through untouched (é, ñ, ü and
- * the rest of Latin-1 included), the punctuation above is folded to its ASCII
- * equivalent, and anything still left over is DROPPED. A name with its
- * decoration removed is correct; a name in mojibake is not.
+ * The rule: anything WinAnsi can encode passes through (é, ñ, ü included),
+ * SUBSTITUTIONS punctuation is folded to ASCII, everything else is dropped.
+ * A name missing its emoji is correct; a name in mojibake is not.
  *
- * Embedding a Unicode font would not change this. pdfkit does no font
- * fallback, so a serif face with no bat glyph draws .notdef boxes instead of
- * mojibake — different garbage, same problem — and rendering emoji at all needs
- * a colour-emoji pipeline a tax invoice has no use for. What a font WOULD buy
- * is the real ₹ sign and non-Latin scripts; until then those are transliterated
- * ("Rs.") or dropped, which is why this is the boundary and not a workaround at
- * one call site.
+ * Embedding a Unicode font would not fix this — pdfkit does no font fallback,
+ * so a missing glyph draws .notdef boxes instead. Same problem, new garbage.
  */
 export const winAnsi = (value) => String(value ?? "")
-  // NFKC, not NFC. It composes ("e" + combining acute becomes "é", which would
-  // otherwise lose its accent to the filter below and silently change the
-  // spelling of a name) AND folds compatibility forms to their plain
-  // equivalents. That second half is what rescues the styled-text display names
-  // creators actually use: "𝐾ℎ𝑤𝑎ℎ𝑖𝑠ℎ 𝑆ℎ𝑎𝑟𝑚𝑎", written in Mathematical Italic,
-  // becomes "Khwahish Sharma" rather than being dropped as unencodable.
+  // NFKC, not NFC. Composing keeps accents ("e" + combining acute -> "é")
+  // that the filter below would otherwise strip, changing a name's spelling.
+  // It also flattens styled text, which creators do use in display names:
+  // "𝐾ℎ𝑤𝑎ℎ𝑖𝑠ℎ 𝑆ℎ𝑎𝑟𝑚𝑎" -> "Khwahish Sharma" instead of being dropped.
   .normalize("NFKC")
   .replace(/[\u2018\u2019\u201A\u201B\u201C\u201D\u201E\u2013\u2014\u2212\u2026\u00A0\u20B9]/g,
     (c) => SUBSTITUTIONS[c])
