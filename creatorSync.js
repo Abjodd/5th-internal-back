@@ -22,9 +22,13 @@ export const keyOf = (cr) => String(cr?.handle || cr?.name || "").toLowerCase().
 // Fields owned by the creators directory — everything else on a campaign's
 // creator entry (fee, status, concept/demo/live, tracking, invoiceNo, dbId,
 // igFetched, ...) is campaign-specific and stays embedded.
+// `vendorId` is here rather than on the campaign entry for the same reason as
+// payType: which vendor bills for a creator is a property of the creator, not
+// of one booking, so it is set once in the directory and every campaign reads it.
 export const PROFILE_FIELDS = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
-  "niche", "state", "languages", "phone", "payType", "payId", "personalDetails",
+  "niche", "state", "languages", "phone", "payType", "payId", "vendorId",
+  "personalDetails",
 ];
 
 const pick = (obj, keys) => keys.reduce((o, k) => (k in (obj || {}) ? { ...o, [k]: obj[k] } : o), {});

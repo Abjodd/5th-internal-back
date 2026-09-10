@@ -18,6 +18,7 @@ import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
 import Quote from "./models/Quote.js";
 import RegistryEntry from "./models/RegistryEntry.js";
+import Vendor from "./models/Vendor.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics, RAW_MEDIA } from "./postMetrics.js";
@@ -126,6 +127,9 @@ registerCrudRoutes("/api/purchase-orders", PurchaseOrder);
 registerCrudRoutes("/api/client-pos", ClientPO);
 registerCrudRoutes("/api/quotes", Quote);
 registerCrudRoutes("/api/registry", RegistryEntry);
+// Vendors (Creators › Vendors) — plain CRUD like the rest: the creators
+// assigned to one are read off Creator.vendorId, never stored here.
+registerCrudRoutes("/api/vendors", Vendor);
 
 // ── Campaigns ────────────────────────────────────────────────────────────────
 

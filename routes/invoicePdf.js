@@ -20,17 +20,21 @@ const invoiceFileQuery = (invoiceNo) =>
   ({ $or: [{ "metadata.invoiceNo": invoiceNo }, { filename: `${invoiceNo}.pdf` }] });
 
 // POST /api/invoices/:invoiceNo/pdf — render + persist a creator invoice PDF.
-// Body: { campaignId, campaignName, brandId, creator, dated, actor }
+// Body: { campaignId, campaignName, brandId, creator, payee, dated, actor }
+// `payee` is who the invoice is raised BY — the creator, or the vendor that
+// bills on their behalf. Resolved frontend-side (src/lib/payee.js); this route
+// renders what it is handed and never re-derives the rule.
 // Regenerating the same invoiceNo replaces the previous file. Also upserts an
 // Invoice doc (id = invoiceNo) so the PDF shows up in Billing / Influencers.
 router.post("/api/invoices/:invoiceNo/pdf", async (req, res) => {
   try {
     const { invoiceNo } = req.params;
-    const { campaignId, campaignName, brandId, creator, dated, actor } = req.body;
+    const { campaignId, campaignName, brandId, creator, payee, dated, actor } = req.body;
     if (!creator?.name) return res.status(400).json({ error: "creator is required" });
 
     const buffer = await renderInvoicePdf({
       creator,
+      payee,
       campaignName,
       invoiceNo,
       dated: dated || new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }),
@@ -69,7 +73,11 @@ router.post("/api/invoices/:invoiceNo/pdf", async (req, res) => {
           campaign: campaignId || null,
           brandId: brandId || null,
           amount: creator.cost ?? creator.fee ?? 0,
-          payType: creator.payType || null,
+          payType: payee?.payType ?? creator.payType ?? null,
+          // Who the money went to. Equal to creatorName unless a vendor raised
+          // it, which is the case worth being able to see in Billing.
+          payeeName: payee?.name || creator.name,
+          payeeKind: payee?.kind || "creator",
           pdfFileId: fileId,
           pdfUrl,
           generatedAt: new Date(),
