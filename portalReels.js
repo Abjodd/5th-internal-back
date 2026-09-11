@@ -330,38 +330,42 @@ async function fetchMedia(url) {
   }
 }
 
-/** Fetch one post and store it. The only place in this file that spends a
- *  credit; everything else reads Mongo. */
+/**
+ * One Trending reel, fetched from HikerAPI exactly once — at the moment the
+ * internal team pastes the link into Insights → Trending (see POST
+ * /api/trending in server.js). The result is stored on the TrendingItem
+ * document itself (`media`); nothing here is ever called again for that
+ * same reel afterwards — no nightly refresh, no retry-on-view, no refetch on
+ * PATCH. The client portal only ever reads the stored `media` back out of
+ * Mongo (GET /api/portal/trending), so a HikerAPI credit is spent once per
+ * reel, period.
+ *
+ * Logs unconditionally (not gated behind IG_DEBUG) so every Hiker call this
+ * path makes shows up in the Render logs on its own — this is the one place
+ * a founder needs to be able to see "yes, that credit was spent, here's
+ * which reel and when" without having to turn debug logging on.
+ *
+ * Returns `{ ok: true, ...fields }` (see toReel) on success, `{ ok: false }`
+ * on any failure — never throws, so a bad/private/deleted link never blocks
+ * saving the row; the client falls back to a plain "Open on Instagram" card.
+ */
+export async function fetchReelSnapshot(url) {
+  console.log(`[trending] HikerAPI request — fetching reel snapshot for ${url}`);
+  const media = await fetchMedia(url);
+  const reel = media ? toReel(media, { postUrl: url }) : null;
+  if (!reel) {
+    console.log(`[trending] HikerAPI request — ${url}: no usable media, storing without a snapshot`);
+    return { ok: false };
+  }
+  console.log(`[trending] HikerAPI request — ${url}: snapshot stored (code=${reel.code || "?"})`);
+  return { ok: true, ...reel };
+}
+
+/** Fetch one post and store it. Along with fetchReelSnapshot above, the only
+ *  places in this file that spend a credit; everything else reads Mongo. */
 async function fetchAndCache(post) {
   const media = await fetchMedia(post.postUrl);
   return cacheReelFromMedia(post.postUrl, media, post);
-}
-
-/**
- * One Instagram post/reel's public data, fetched fresh, for a link that has
- * nothing to do with the campaign roster this file otherwise serves —
- * currently just Insights → Trending, where the internal team pastes a
- * permalink by hand rather than it arriving via a creator's `live.postUrl`.
- *
- * Deliberately NOT cached in ReelCache or scheduled for refresh: a Trending
- * item is curated on demand, not tracked delivery, so there is no roster walk
- * that would ever revisit it. Spends exactly one HikerAPI call and returns
- * the same shape toReel() produces everywhere else. null on any failure —
- * private post, deleted, rate-limited, HIKERAPI_TOKEN unset — and the caller
- * is expected to save the bare link rather than block on this succeeding.
- *
- * The signed video/poster URLs this returns carry the same expiry as every
- * other reel here (~32h video, ~106h poster — see signedExpiryOf) and are
- * NOT re-fetched later, so an old Trending reel eventually stops playing and
- * falls back to a link. Accepted deliberately: this content is meant to be
- * current, not archived, and re-fetching it on a schedule is the machinery
- * the rest of this file exists for — building that twice wasn't worth it for
- * hand-curated Trending links.
- */
-export async function fetchReelSnapshot(url) {
-  const media = await fetchMedia(url);
-  if (!media) return null;
-  return toReel(media, { postUrl: url });
 }
 
 /**

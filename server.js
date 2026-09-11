@@ -136,9 +136,18 @@ registerCrudRoutes("/api/vendors", Vendor);
 // reads/writes this; the client portal reads a separate, universal,
 // un-scoped copy at GET /api/portal/trending below (this shelf is
 // deliberately the same for every brand, not per-client like the rest of the
-// portal). Hand-written rather than registerCrudRoutes: POST needs to fetch
-// and attach the reel's actual video/poster/stats before saving, which the
-// generic factory has no hook for.
+// portal). Hand-written rather than registerCrudRoutes only because PATCH
+// needs the same id-remap the GET/POST below do.
+//
+// A reel is a link the internal team pastes in by hand — there is nothing to
+// discover, but there IS something to look up: what the post actually looks
+// like. POST below spends exactly one HikerAPI credit per reel, at save time,
+// and stores the result on the row (see fetchReelSnapshot in portalReels.js).
+// That single snapshot is what the client renders from (GET
+// /api/portal/trending) — nothing is ever re-fetched for a reel after this:
+// no nightly refresh, no refetch on PATCH, no fetch on the client. A private,
+// deleted, or otherwise unreadable link just stores with no snapshot and the
+// client shows a plain "Open on Instagram" card for it instead.
 app.get("/api/trending", async (req, res) => {
   try {
     const docs = await TrendingItem.find({}).sort({ createdAt: -1 }).lean();
@@ -148,16 +157,16 @@ app.get("/api/trending", async (req, res) => {
   }
 });
 
-// A note saves as typed. A reel additionally spends one HikerAPI call
-// (fetchReelSnapshot) to pull its actual video, poster, caption and stats,
-// so the portal can play it inline instead of only linking out — see
-// portalReels.js. Never blocks the save on that call failing: a private,
-// deleted or rate-limited post still saves the bare link with `media.ok:
-// false`, and the client falls back to a plain "open on Instagram" card.
 app.post("/api/trending", async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.id) return res.status(400).json({ error: "id is required" });
+    // One HikerAPI credit, spent here and only here: a reel's snapshot is
+    // fetched once, at the moment it's saved, and never again. See
+    // fetchReelSnapshot's own doc comment in portalReels.js.
+    const media = body.kind === "reel" && body.url
+      ? await fetchReelSnapshot(body.url)
+      : undefined;
     const doc = {
       _id: body.id,
       kind: body.kind,
@@ -165,11 +174,8 @@ app.post("/api/trending", async (req, res) => {
       text: body.text || null,
       author: body.author || null,
       createdAt: new Date(),
+      ...(media ? { media } : {}),
     };
-    if (body.kind === "reel" && body.url) {
-      const snapshot = await fetchReelSnapshot(body.url);
-      doc.media = snapshot ? { ok: true, ...snapshot } : { ok: false };
-    }
     const created = await TrendingItem.create(doc);
     const { _id, ...rest } = created.toObject();
     res.status(201).json({ id: _id, ...rest });
@@ -187,31 +193,6 @@ app.patch("/api/trending/:id", async (req, res) => {
       { new: true },
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
-    const { _id, ...rest } = updated;
-    res.json({ id: _id, ...rest });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Re-spends one HikerAPI call for an item that already exists — for a link
-// saved before fetchReelSnapshot existed, or one whose fetch failed the first
-// time (bad timing, a since-lifted rate limit). Lets the internal team retry
-// from the list instead of deleting and re-pasting the same URL.
-app.post("/api/trending/:id/refetch", async (req, res) => {
-  try {
-    const doc = await TrendingItem.findById(req.params.id).lean();
-    if (!doc) return res.status(404).json({ error: "not found" });
-    if (doc.kind !== "reel" || !doc.url) {
-      return res.status(400).json({ error: "only reel items have media to fetch" });
-    }
-    const snapshot = await fetchReelSnapshot(doc.url);
-    const media = snapshot ? { ok: true, ...snapshot } : { ok: false };
-    const updated = await TrendingItem.findByIdAndUpdate(
-      req.params.id,
-      { $set: { media } },
-      { new: true },
-    ).lean();
     const { _id, ...rest } = updated;
     res.json({ id: _id, ...rest });
   } catch (err) {
