@@ -22,11 +22,12 @@ import Vendor from "./models/Vendor.js";
 import { fetchInstagramProfile } from "./instagramfetchhiker.js";
 import { fetchYouTubeChannel } from "./youtubeFetch.js";
 import { fetchPostMetrics, RAW_MEDIA } from "./postMetrics.js";
-import { getClientReels, refreshAllReels, cacheReelFromMedia, warmReels, getReelPoster, backfillPosters } from "./portalReels.js";
+import { getClientReels, refreshAllReels, cacheReelFromMedia, warmReels, getReelPoster, backfillPosters, fetchReelSnapshot } from "./portalReels.js";
 import { startScheduler } from "./scheduler.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
 import Finding from "./models/Finding.js";
+import TrendingItem from "./models/TrendingItem.js";
 // Brand logos ride the same machinery as user profile photos — see avatarStore.js
 // for why images live inline on the document and are served from their own route.
 import { withAvatar, serveAvatar, OMIT_AVATAR, toBuffer } from "./avatarStore.js";
@@ -130,6 +131,102 @@ registerCrudRoutes("/api/registry", RegistryEntry);
 // Vendors (Creators › Vendors) — plain CRUD like the rest: the creators
 // assigned to one are read off Creator.vendorId, never stored here.
 registerCrudRoutes("/api/vendors", Vendor);
+
+// Insights → Trending (internal-authored) — the internal Founder Summary page
+// reads/writes this; the client portal reads a separate, universal,
+// un-scoped copy at GET /api/portal/trending below (this shelf is
+// deliberately the same for every brand, not per-client like the rest of the
+// portal). Hand-written rather than registerCrudRoutes: POST needs to fetch
+// and attach the reel's actual video/poster/stats before saving, which the
+// generic factory has no hook for.
+app.get("/api/trending", async (req, res) => {
+  try {
+    const docs = await TrendingItem.find({}).sort({ createdAt: -1 }).lean();
+    res.json(docs.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// A note saves as typed. A reel additionally spends one HikerAPI call
+// (fetchReelSnapshot) to pull its actual video, poster, caption and stats,
+// so the portal can play it inline instead of only linking out — see
+// portalReels.js. Never blocks the save on that call failing: a private,
+// deleted or rate-limited post still saves the bare link with `media.ok:
+// false`, and the client falls back to a plain "open on Instagram" card.
+app.post("/api/trending", async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.id) return res.status(400).json({ error: "id is required" });
+    const doc = {
+      _id: body.id,
+      kind: body.kind,
+      url: body.url || null,
+      text: body.text || null,
+      author: body.author || null,
+      createdAt: new Date(),
+    };
+    if (body.kind === "reel" && body.url) {
+      const snapshot = await fetchReelSnapshot(body.url);
+      doc.media = snapshot ? { ok: true, ...snapshot } : { ok: false };
+    }
+    const created = await TrendingItem.create(doc);
+    const { _id, ...rest } = created.toObject();
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "A record with this id already exists." });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/trending/:id", async (req, res) => {
+  try {
+    const updated = await TrendingItem.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      { new: true },
+    ).lean();
+    if (!updated) return res.status(404).json({ error: "not found" });
+    const { _id, ...rest } = updated;
+    res.json({ id: _id, ...rest });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Re-spends one HikerAPI call for an item that already exists — for a link
+// saved before fetchReelSnapshot existed, or one whose fetch failed the first
+// time (bad timing, a since-lifted rate limit). Lets the internal team retry
+// from the list instead of deleting and re-pasting the same URL.
+app.post("/api/trending/:id/refetch", async (req, res) => {
+  try {
+    const doc = await TrendingItem.findById(req.params.id).lean();
+    if (!doc) return res.status(404).json({ error: "not found" });
+    if (doc.kind !== "reel" || !doc.url) {
+      return res.status(400).json({ error: "only reel items have media to fetch" });
+    }
+    const snapshot = await fetchReelSnapshot(doc.url);
+    const media = snapshot ? { ok: true, ...snapshot } : { ok: false };
+    const updated = await TrendingItem.findByIdAndUpdate(
+      req.params.id,
+      { $set: { media } },
+      { new: true },
+    ).lean();
+    const { _id, ...rest } = updated;
+    res.json({ id: _id, ...rest });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/trending/:id", async (req, res) => {
+  try {
+    await TrendingItem.findByIdAndDelete(req.params.id);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ── Campaigns ────────────────────────────────────────────────────────────────
 
@@ -663,6 +760,23 @@ app.get("/api/portal/client", async (req, res) => {
       profile: pick(doc.profile, CLIENT_PROFILE_PUBLIC),
       products: Array.isArray(doc.products) ? doc.products : [],
       createdAt: doc.createdAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/trending — the Insights → Trending shelf: Instagram links
+// and short notes the internal team curates by hand (see POST/PATCH/DELETE
+// /api/trending above). Deliberately UNIVERSAL, unlike every other /api/portal
+// route on this page: every brand sees the same feed, so — unlike
+// /api/portal/reels and /api/portal/client — this one takes no brand scope
+// and needs none to resolve before it can answer.
+app.get("/api/portal/trending", async (req, res) => {
+  try {
+    const rows = await TrendingItem.find({}).sort({ createdAt: -1 }).lean();
+    res.json({
+      items: rows.map(({ _id, brandId, ...rest }) => ({ id: _id, ...rest })),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

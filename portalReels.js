@@ -338,6 +338,33 @@ async function fetchAndCache(post) {
 }
 
 /**
+ * One Instagram post/reel's public data, fetched fresh, for a link that has
+ * nothing to do with the campaign roster this file otherwise serves —
+ * currently just Insights → Trending, where the internal team pastes a
+ * permalink by hand rather than it arriving via a creator's `live.postUrl`.
+ *
+ * Deliberately NOT cached in ReelCache or scheduled for refresh: a Trending
+ * item is curated on demand, not tracked delivery, so there is no roster walk
+ * that would ever revisit it. Spends exactly one HikerAPI call and returns
+ * the same shape toReel() produces everywhere else. null on any failure —
+ * private post, deleted, rate-limited, HIKERAPI_TOKEN unset — and the caller
+ * is expected to save the bare link rather than block on this succeeding.
+ *
+ * The signed video/poster URLs this returns carry the same expiry as every
+ * other reel here (~32h video, ~106h poster — see signedExpiryOf) and are
+ * NOT re-fetched later, so an old Trending reel eventually stops playing and
+ * falls back to a link. Accepted deliberately: this content is meant to be
+ * current, not archived, and re-fetching it on a schedule is the machinery
+ * the rest of this file exists for — building that twice wasn't worth it for
+ * hand-curated Trending links.
+ */
+export async function fetchReelSnapshot(url) {
+  const media = await fetchMedia(url);
+  if (!media) return null;
+  return toReel(media, { postUrl: url });
+}
+
+/**
  * The Instagram posts on one roster, deduped against `seen`.
  *
  * Split out of collectPosts because the write path needs the same walk over a
