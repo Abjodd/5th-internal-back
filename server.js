@@ -28,6 +28,11 @@ import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import Client from "./models/Client.js";
 import Finding from "./models/Finding.js";
 import TrendingItem from "./models/TrendingItem.js";
+import AccountQuestions from "./models/AccountQuestions.js";
+import MarketWatchItem from "./models/MarketWatchItem.js";
+import { getInfluencerMarketingNews } from "./newsFeed.js";
+import NewsletterItem from "./models/NewsletterItem.js";
+import { parseNewsletterFile, OMIT_NEWSLETTER_FILE } from "./newsletterStore.js";
 // Brand logos ride the same machinery as user profile photos — see avatarStore.js
 // for why images live inline on the document and are served from their own route.
 import { withAvatar, serveAvatar, OMIT_AVATAR, toBuffer } from "./avatarStore.js";
@@ -204,6 +209,203 @@ app.delete("/api/trending/:id", async (req, res) => {
   try {
     await TrendingItem.findByIdAndDelete(req.params.id);
     res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Insights → Market Watch (internal-authored, PER BRAND unlike Trending
+// above) — the same Reels/Insights shelf as Trending, but scoped to one
+// brand at a time: every document carries a brandId (the same id as
+// Client._id), so each brand's internal team only ever sees and edits their
+// own items, and each brand's portal only ever reads its own feed (GET
+// /api/portal/market-watch below). Otherwise identical to /api/trending —
+// same snapshot-once-at-save-time behavior via fetchReelSnapshot.
+app.get("/api/market-watch", async (req, res) => {
+  try {
+    const brandId = String(req.query.brandId || "").trim();
+    if (!brandId) return res.status(400).json({ error: "brandId is required" });
+    const docs = await MarketWatchItem.find({ brandId }).sort({ createdAt: -1 }).lean();
+    res.json(docs.map(({ _id, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/market-watch", async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.id) return res.status(400).json({ error: "id is required" });
+    const brandId = String(body.brandId || "").trim();
+    if (!brandId) return res.status(400).json({ error: "brandId is required" });
+    // One HikerAPI credit, spent here and only here — see the matching
+    // comment on POST /api/trending above.
+    const media = body.kind === "reel" && body.url
+      ? await fetchReelSnapshot(body.url)
+      : undefined;
+    const doc = {
+      _id: body.id,
+      brandId,
+      kind: body.kind,
+      url: body.url || null,
+      text: body.text || null,
+      author: body.author || null,
+      createdAt: new Date(),
+      ...(media ? { media } : {}),
+    };
+    const created = await MarketWatchItem.create(doc);
+    const { _id, ...rest } = created.toObject();
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "A record with this id already exists." });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/market-watch/:id", async (req, res) => {
+  try {
+    const updated = await MarketWatchItem.findByIdAndUpdate(
+      req.params.id,
+      { $set: req.body },
+      { new: true },
+    ).lean();
+    if (!updated) return res.status(404).json({ error: "not found" });
+    const { _id, ...rest } = updated;
+    res.json({ id: _id, ...rest });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/market-watch/:id", async (req, res) => {
+  try {
+    await MarketWatchItem.findByIdAndDelete(req.params.id);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Insights → Newsletter (internal-authored, PER BRAND) — a brand's own
+// history of newsletter PDFs the internal team has sent them, newest first.
+// Unlike Market Watch/Trending above this isn't a reel/note shelf: each row
+// is one uploaded PDF (see newsletterStore.js for the upload/size-cap
+// machinery), kept forever rather than replaced in place, so a brand's
+// portal can show its whole newsletter history with dates.
+app.get("/api/newsletter", async (req, res) => {
+  try {
+    const brandId = String(req.query.brandId || "").trim();
+    if (!brandId) return res.status(400).json({ error: "brandId is required" });
+    const docs = await NewsletterItem.find({ brandId }, OMIT_NEWSLETTER_FILE)
+      .sort({ uploadedAt: -1 })
+      .lean();
+    res.json(docs.map(({ _id, file, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/newsletter", async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.id) return res.status(400).json({ error: "id is required" });
+    const brandId = String(body.brandId || "").trim();
+    if (!brandId) return res.status(400).json({ error: "brandId is required" });
+    let file;
+    try {
+      file = parseNewsletterFile(body.file);
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+    const doc = {
+      _id: body.id,
+      brandId,
+      title: body.title || "Newsletter.pdf",
+      file,
+      author: body.author || null,
+      uploadedAt: new Date(),
+    };
+    const created = await NewsletterItem.create(doc);
+    const { _id, file: _f, ...rest } = created.toObject();
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ error: "A record with this id already exists." });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/newsletter/:id", async (req, res) => {
+  try {
+    await NewsletterItem.findByIdAndDelete(req.params.id);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/newsletter/:id/file — the PDF itself, for the internal team to
+// double-check what they uploaded. Same read-back shape as avatarStore.js's
+// serveAvatar (toBuffer handles the .lean()-vs-hydrated Buffer trap the same
+// way), minus the year-long immutable cache — a newsletter's bytes never
+// change in place, so this could be cached that aggressively too, but there
+// is no reason to bother for what is light, internal-only traffic.
+app.get("/api/newsletter/:id/file", async (req, res) => {
+  try {
+    const doc = await NewsletterItem.findById(req.params.id).lean();
+    const bytes = toBuffer(doc?.file?.data);
+    if (!bytes) return res.status(404).json({ error: "not found" });
+    res.set("Content-Type", doc.file.contentType || "application/pdf");
+    res.send(bytes);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/news/influencer-marketing — Market Watch's read-only "Latest
+// News" list: industry headlines fetched from Google News (see
+// newsFeed.js), not internal-team-authored. Universal, same feed used by
+// every brand's Market Watch tab here and by GET /api/portal/news below —
+// there's nothing to scope, so unlike market-watch above this takes no
+// brandId.
+app.get("/api/news/influencer-marketing", async (req, res) => {
+  try {
+    const items = await getInfluencerMarketingNews();
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Insights → Questions (internal-authored, PER BRAND unlike Trending above) —
+// the Founder Summary page's Questions editor reads/writes this: one document
+// per brand, keyed by the same id as Client._id, upserted whenever a field is
+// saved rather than accumulated as dated rows. The client portal reads a
+// brand-scoped copy at GET /api/portal/questions below.
+const QUESTION_FIELDS = ["whatWorked", "whatDidntWork", "nextActions", "areasToImprove"];
+
+app.get("/api/account-questions/:brandId", async (req, res) => {
+  try {
+    const doc = await AccountQuestions.findById(req.params.brandId).lean();
+    const out = {};
+    for (const k of QUESTION_FIELDS) out[k] = doc?.[k] || "";
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/account-questions/:brandId", async (req, res) => {
+  try {
+    const patch = { updatedAt: new Date() };
+    for (const k of QUESTION_FIELDS) if (k in req.body) patch[k] = req.body[k];
+    const updated = await AccountQuestions.findByIdAndUpdate(
+      req.params.brandId,
+      { $set: patch },
+      { new: true, upsert: true },
+    ).lean();
+    const out = {};
+    for (const k of QUESTION_FIELDS) out[k] = updated?.[k] || "";
+    res.json(out);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -742,6 +944,97 @@ app.get("/api/portal/client", async (req, res) => {
       products: Array.isArray(doc.products) ? doc.products : [],
       createdAt: doc.createdAt || null,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/questions?brand=BRANDID — the Insights → Questions shelf:
+// four fixed prompts (What Worked / What Didn't Work / Next Actions / Areas to
+// Improve) the internal team answers per brand on the Founder Summary page
+// (see /api/account-questions above). Brand-scoped, unlike /api/portal/trending
+// below — every client's answers are their own. A field with no answer yet is
+// null rather than "" so the client can tell "not written" from "written
+// blank" and leave the prompt out entirely instead of showing empty text.
+app.get("/api/portal/questions", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const doc = await AccountQuestions.findById(scope.id).lean();
+    res.json({
+      whatWorked: doc?.whatWorked || null,
+      whatDidntWork: doc?.whatDidntWork || null,
+      nextActions: doc?.nextActions || null,
+      areasToImprove: doc?.areasToImprove || null,
+      updatedAt: doc?.updatedAt || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/market-watch?brand=BRANDID — a brand's own Market Watch
+// shelf: the same Reels/Insights shape as /api/portal/trending below, but
+// scoped to this one brand (see /api/market-watch above) rather than
+// universal — every brand reads only the items added for it.
+app.get("/api/portal/market-watch", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const rows = await MarketWatchItem.find({ brandId: scope.id }).sort({ createdAt: -1 }).lean();
+    res.json({
+      items: rows.map(({ _id, brandId, ...rest }) => ({ id: _id, ...rest })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/news — the client portal's copy of Market Watch's Latest
+// News list. Same underlying cache as GET /api/news/influencer-marketing
+// above (see newsFeed.js) and, like that route, takes no brand scope: this
+// is industry news, not per-brand data.
+app.get("/api/portal/news", async (req, res) => {
+  try {
+    const items = await getInfluencerMarketingNews();
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/newsletter?brand=BRANDID — a brand's own newsletter
+// history, newest first (see /api/newsletter above). Brand-scoped like
+// /api/portal/market-watch, not universal like /api/portal/trending below:
+// each brand only ever sees the PDFs uploaded for it.
+app.get("/api/portal/newsletter", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const rows = await NewsletterItem.find({ brandId: scope.id }, OMIT_NEWSLETTER_FILE)
+      .sort({ uploadedAt: -1 })
+      .lean();
+    res.json({
+      items: rows.map(({ _id, brandId, file, ...rest }) => ({ id: _id, ...rest })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/newsletter/:id/file?brand=BRANDID — the PDF itself. The
+// brand filter is part of the LOOKUP here, not just the list above: a wrong
+// or guessed id for another brand's PDF has to come back 404, the same as
+// it not existing, rather than leaking another brand's newsletter.
+app.get("/api/portal/newsletter/:id/file", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const doc = await NewsletterItem.findOne({ _id: req.params.id, brandId: scope.id }).lean();
+    const bytes = toBuffer(doc?.file?.data);
+    if (!bytes) return res.status(404).json({ error: "not found" });
+    res.set("Content-Type", doc.file.contentType || "application/pdf");
+    res.send(bytes);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
