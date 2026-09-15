@@ -6,11 +6,14 @@
 // a `creatorId` reference — see creatorSync.js for the split-on-write /
 // hydrate-on-read logic that keeps the two in step.
 import { Router } from "express";
+import { randomUUID } from "node:crypto";
 import Campaign from "../models/Campaign.js";
 import Invoice from "../models/Invoice.js";
 import Creator from "../models/Creator.js";
+import CreatorDocument from "../models/CreatorDocument.js";
 import { keyOf, PROFILE_FIELDS } from "../creatorSync.js";
 import { withAvatar, serveAvatar, OMIT_AVATAR } from "../avatarStore.js";
+import { parsePdfUpload, sendPdf, OMIT_FILE } from "../pdfUpload.js";
 import { applyRemoteAvatar } from "../remoteAvatar.js";
 
 // `hasAvatar` is derived from `avatarUpdatedAt`, not from the bytes — the list
@@ -154,5 +157,65 @@ router.patch("/api/creators/:id", async (req, res) => {
 // Cached immutably and read through ?v=<avatarUpdatedAt>, so a replaced photo
 // busts the cache the instant it changes. See serveAvatar.
 router.get("/api/creators/:id/avatar", serveAvatar(Creator));
+
+// ── AGREEMENTS ───────────────────────────────────────────────────────────────
+// Signed PDFs held against one creator (models/CreatorDocument.js). Scoped by
+// BOTH ids, so a document is only reachable through the creator that owns it.
+const creatorKey = (req) => String(req.params.id).toLowerCase().trim();
+const docScope = (req) => ({ _id: req.params.docId, creatorId: creatorKey(req) });
+
+router.get("/api/creators/:id/documents", async (req, res) => {
+  try {
+    const docs = await CreatorDocument.find({ creatorId: creatorKey(req) }, OMIT_FILE)
+      .sort({ uploadedAt: -1 })
+      .lean();
+    res.json(docs.map(({ _id, creatorId, ...rest }) => ({ id: _id, ...rest })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/api/creators/:id/documents", async (req, res) => {
+  try {
+    const creatorId = creatorKey(req);
+    // An upload filed under a key nobody owns would be invisible and unrecoverable.
+    if (!(await Creator.exists({ _id: creatorId }))) return res.status(404).json({ error: "creator not found" });
+
+    let file;
+    try { file = parsePdfUpload(req.body?.file, "Agreement"); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    const created = await CreatorDocument.create({
+      _id: randomUUID(),
+      creatorId,
+      title: String(req.body.title || "").trim() || "Agreement.pdf",
+      file,
+      uploadedBy: req.body.uploadedBy || null,
+      uploadedAt: new Date(),
+    });
+    const { _id, file: _f, creatorId: _c, ...rest } = created.toObject();
+    res.status(201).json({ id: _id, ...rest });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/api/creators/:id/documents/:docId/file", async (req, res) => {
+  try {
+    sendPdf(res, await CreatorDocument.findOne(docScope(req)).lean());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/api/creators/:id/documents/:docId", async (req, res) => {
+  try {
+    const { deletedCount } = await CreatorDocument.deleteOne(docScope(req));
+    if (!deletedCount) return res.status(404).json({ error: "not found" });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 export default router;

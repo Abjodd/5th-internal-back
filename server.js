@@ -32,7 +32,7 @@ import AccountQuestions from "./models/AccountQuestions.js";
 import MarketWatchItem from "./models/MarketWatchItem.js";
 import { getInfluencerMarketingNews } from "./newsFeed.js";
 import NewsletterItem from "./models/NewsletterItem.js";
-import { parseNewsletterFile, OMIT_NEWSLETTER_FILE } from "./newsletterStore.js";
+import { parsePdfUpload, sendPdf, OMIT_FILE } from "./pdfUpload.js";
 // Brand logos ride the same machinery as user profile photos — see avatarStore.js
 // for why images live inline on the document and are served from their own route.
 import { withAvatar, serveAvatar, OMIT_AVATAR, toBuffer } from "./avatarStore.js";
@@ -289,14 +289,14 @@ app.delete("/api/market-watch/:id", async (req, res) => {
 // Insights → Newsletter (internal-authored, PER BRAND) — a brand's own
 // history of newsletter PDFs the internal team has sent them, newest first.
 // Unlike Market Watch/Trending above this isn't a reel/note shelf: each row
-// is one uploaded PDF (see newsletterStore.js for the upload/size-cap
+// is one uploaded PDF (see pdfUpload.js for the upload/size-cap
 // machinery), kept forever rather than replaced in place, so a brand's
 // portal can show its whole newsletter history with dates.
 app.get("/api/newsletter", async (req, res) => {
   try {
     const brandId = String(req.query.brandId || "").trim();
     if (!brandId) return res.status(400).json({ error: "brandId is required" });
-    const docs = await NewsletterItem.find({ brandId }, OMIT_NEWSLETTER_FILE)
+    const docs = await NewsletterItem.find({ brandId }, OMIT_FILE)
       .sort({ uploadedAt: -1 })
       .lean();
     res.json(docs.map(({ _id, file, ...rest }) => ({ id: _id, ...rest })));
@@ -313,7 +313,7 @@ app.post("/api/newsletter", async (req, res) => {
     if (!brandId) return res.status(400).json({ error: "brandId is required" });
     let file;
     try {
-      file = parseNewsletterFile(body.file);
+      file = parsePdfUpload(body.file, "Newsletter");
     } catch (e) {
       return res.status(400).json({ error: e.message });
     }
@@ -344,18 +344,10 @@ app.delete("/api/newsletter/:id", async (req, res) => {
 });
 
 // GET /api/newsletter/:id/file — the PDF itself, for the internal team to
-// double-check what they uploaded. Same read-back shape as avatarStore.js's
-// serveAvatar (toBuffer handles the .lean()-vs-hydrated Buffer trap the same
-// way), minus the year-long immutable cache — a newsletter's bytes never
-// change in place, so this could be cached that aggressively too, but there
-// is no reason to bother for what is light, internal-only traffic.
+// double-check what they uploaded.
 app.get("/api/newsletter/:id/file", async (req, res) => {
   try {
-    const doc = await NewsletterItem.findById(req.params.id).lean();
-    const bytes = toBuffer(doc?.file?.data);
-    if (!bytes) return res.status(404).json({ error: "not found" });
-    res.set("Content-Type", doc.file.contentType || "application/pdf");
-    res.send(bytes);
+    sendPdf(res, await NewsletterItem.findById(req.params.id).lean());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1011,7 +1003,7 @@ app.get("/api/portal/newsletter", async (req, res) => {
   try {
     const scope = await resolveBrandScope(req.query);
     if (!requireBrandScope(res, scope)) return;
-    const rows = await NewsletterItem.find({ brandId: scope.id }, OMIT_NEWSLETTER_FILE)
+    const rows = await NewsletterItem.find({ brandId: scope.id }, OMIT_FILE)
       .sort({ uploadedAt: -1 })
       .lean();
     res.json({
@@ -1030,11 +1022,7 @@ app.get("/api/portal/newsletter/:id/file", async (req, res) => {
   try {
     const scope = await resolveBrandScope(req.query);
     if (!requireBrandScope(res, scope)) return;
-    const doc = await NewsletterItem.findOne({ _id: req.params.id, brandId: scope.id }).lean();
-    const bytes = toBuffer(doc?.file?.data);
-    if (!bytes) return res.status(404).json({ error: "not found" });
-    res.set("Content-Type", doc.file.contentType || "application/pdf");
-    res.send(bytes);
+    sendPdf(res, await NewsletterItem.findOne({ _id: req.params.id, brandId: scope.id }).lean());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
