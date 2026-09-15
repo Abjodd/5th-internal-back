@@ -35,6 +35,10 @@ const CreatorSchema = new mongoose.Schema(
     phone: String,
     payType: String,
     payId: String,
+    // Who manages this creator. "Managed by vendors" is NOT a value here —
+    // `vendorId` already answers that, and the frontend derives it (see
+    // src/lib/management.js); absent reads as "general".
+    managedBy: { type: String, enum: ["fifthavenue", "general"], default: "general" },
     personalDetails: {
       pan: String,
       email: String,

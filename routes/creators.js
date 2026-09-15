@@ -144,6 +144,9 @@ router.patch("/api/creators/:id", async (req, res) => {
     await inf.save();
     res.json(pubAvatar({ id: key, ...inf.toObject() }));
   } catch (err) {
+    // A value the schema rejects (e.g. managedBy outside its enum) is the
+    // caller's mistake, not ours — 500 would have the frontend report an outage.
+    if (err.name === "ValidationError") return res.status(400).json({ error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
