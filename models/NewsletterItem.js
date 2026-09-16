@@ -8,9 +8,9 @@ import mongoose from "mongoose";
  * MarketWatchItem, not universal like Trending: each brand keeps its own
  * newsletter history, not one shared feed.
  *
- * `file` holds the PDF bytes inline (see newsletterStore.js for why, and
+ * `file` holds the PDF bytes inline (see pdfUpload.js for why, and
  * for the 2MB cap) — every list query must project it away with
- * OMIT_NEWSLETTER_FILE so a history list stays light; the PDF itself is
+ * OMIT_FILE so a history list stays light; the PDF itself is
  * served from its own byte-serving route, the same shape as
  * avatarStore.js's serveAvatar.
  */
