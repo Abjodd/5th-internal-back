@@ -55,6 +55,11 @@ const CampaignSchema = new mongoose.Schema(
     cmId: String,
     eaId: String,
     brief: mongoose.Schema.Types.Mixed,
+    // Campaign-specific retrospective — same 4-question shape as the account-
+    // level Insights page (whatWorked/whatDidntWork/nextActions/areasToImprove),
+    // filled in by the internal team and surfaced on the client portal's
+    // campaign detail page right after Observations.
+    insights: mongoose.Schema.Types.Mixed,
     briefStatus: String,
     bmNote: String,
     cmNote: String,
