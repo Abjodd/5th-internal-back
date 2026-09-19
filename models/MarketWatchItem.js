@@ -21,7 +21,8 @@ const MarketWatchItemSchema = new mongoose.Schema(
     brandId: { type: String, index: true }, // same id as Client._id — scopes this item to one brand
     kind: { type: String },       // "reel" (an Instagram link) | "note" (typed insight)
     url: String,                  // kind: "reel"
-    text: String,                 // kind: "note"
+    text: String,                 // kind: "note" — the answer
+    topic: String,                // kind: "note" — the topic the answer is about; optional so notes added before this field existed still read fine with none
     author: String,               // who on the internal team added it
     createdAt: { type: Date, default: Date.now },
   },

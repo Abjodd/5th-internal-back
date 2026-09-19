@@ -30,6 +30,7 @@ import Finding from "./models/Finding.js";
 import TrendingItem from "./models/TrendingItem.js";
 import AccountQuestions from "./models/AccountQuestions.js";
 import MarketWatchItem from "./models/MarketWatchItem.js";
+import Favourite from "./models/Favourite.js";
 import { getInfluencerMarketingNews } from "./newsFeed.js";
 import NewsletterItem from "./models/NewsletterItem.js";
 import { parsePdfUpload, sendPdf, OMIT_FILE } from "./pdfUpload.js";
@@ -249,6 +250,7 @@ app.post("/api/market-watch", async (req, res) => {
       kind: body.kind,
       url: body.url || null,
       text: body.text || null,
+      topic: body.topic || null,
       author: body.author || null,
       createdAt: new Date(),
       ...(media ? { media } : {}),
@@ -280,6 +282,53 @@ app.patch("/api/market-watch/:id", async (req, res) => {
 app.delete("/api/market-watch/:id", async (req, res) => {
   try {
     await MarketWatchItem.findByIdAndDelete(req.params.id);
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Insights → Favourites (Founder Summary Insights tab, read-only) — one
+// brand's own starred Trending/Market Watch items, newest first, joined
+// back onto those two collections for their full reel/note content (this
+// table only stores the pointer — see models/Favourite.js). A favourite
+// whose underlying item has since been deleted from Trending/Market Watch
+// is silently dropped rather than shown as a broken row.
+app.get("/api/favourites", async (req, res) => {
+  try {
+    const brandId = String(req.query.brandId || "").trim();
+    if (!brandId) return res.status(400).json({ error: "brandId is required" });
+    const favs = await Favourite.find({ brandId }).sort({ createdAt: -1 }).lean();
+    const trendingIds = favs.filter((f) => f.itemType === "trending").map((f) => f.itemId);
+    const marketWatchIds = favs.filter((f) => f.itemType === "market-watch").map((f) => f.itemId);
+    const [trendingDocs, marketWatchDocs] = await Promise.all([
+      trendingIds.length ? TrendingItem.find({ _id: { $in: trendingIds } }).lean() : [],
+      marketWatchIds.length ? MarketWatchItem.find({ _id: { $in: marketWatchIds } }).lean() : [],
+    ]);
+    const byKey = new Map();
+    for (const d of trendingDocs) byKey.set(`trending:${d._id}`, d);
+    for (const d of marketWatchDocs) byKey.set(`market-watch:${d._id}`, d);
+    const items = favs
+      .map((f) => {
+        const doc = byKey.get(`${f.itemType}:${f.itemId}`);
+        if (!doc) return null; // the underlying reel/note was since deleted
+        const { _id, brandId: _b, ...rest } = doc;
+        return { id: _id, favouriteId: f._id, source: f.itemType, favouritedAt: f.createdAt, ...rest };
+      })
+      .filter(Boolean);
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/favourites/:id — unstar on the brand's behalf (the internal
+// team tidying up), exactly what the brand's own portal button does.
+// `:id` is the Favourite row's own id (favouriteId above), not the
+// underlying reel/note's id.
+app.delete("/api/favourites/:id", async (req, res) => {
+  try {
+    await Favourite.findByIdAndDelete(req.params.id);
     res.status(204).end();
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1041,6 +1090,62 @@ app.get("/api/portal/trending", async (req, res) => {
       items: rows.map(({ _id, brandId, ...rest }) => ({ id: _id, ...rest })),
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/favourites?brand=BRANDID — which of this brand's own
+// Trending/Market Watch items it has starred, as bare pointers: the client
+// already holds the full item content from GET /api/portal/trending and GET
+// /api/portal/market-watch, so this only needs to say which ones are
+// starred, not repeat their content. Brand-scoped like every /api/portal
+// route except trending/news above.
+app.get("/api/portal/favourites", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    const rows = await Favourite.find({ brandId: scope.id }).lean();
+    res.json({ items: rows.map((r) => ({ itemId: r.itemId, itemType: r.itemType })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/portal/favourites — the portal's write against Trending/Market
+// Watch: a brand starring or unstarring one reel or note for its own
+// account (see addAssetComment/decideCreator above for the portal's other
+// writes, same brand-scoped shape). Toggles rather than taking an explicit
+// on/off, so the client's star button doesn't need to already know the
+// current state before it can flip it.
+app.post("/api/portal/favourites", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.body);
+    if (!requireBrandScope(res, scope)) return;
+    const itemType = String(req.body?.itemType || "");
+    const itemId = String(req.body?.itemId || "");
+    if (!["trending", "market-watch"].includes(itemType) || !itemId) {
+      return res.status(400).json({ error: "itemType (trending|market-watch) and itemId are required" });
+    }
+    const existing = await Favourite.findOne({ brandId: scope.id, itemType, itemId });
+    if (existing) {
+      await Favourite.deleteOne({ _id: existing._id });
+      return res.json({ itemId, itemType, favourited: false });
+    }
+    await Favourite.create({
+      _id: `fav_${scope.id}_${itemType}_${itemId}`,
+      brandId: scope.id,
+      itemType,
+      itemId,
+      createdAt: new Date(),
+    });
+    res.json({ itemId, itemType, favourited: true });
+  } catch (err) {
+    if (err.code === 11000) {
+      // Lost a race with another tab's toggle for the same star — the row
+      // exists either way, which is the state a duplicate click was
+      // already asking for.
+      return res.json({ itemId: req.body?.itemId, itemType: req.body?.itemType, favourited: true });
+    }
     res.status(500).json({ error: err.message });
   }
 });
