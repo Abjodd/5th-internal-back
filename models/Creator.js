@@ -32,6 +32,20 @@ const CreatorSchema = new mongoose.Schema(
     // creator's state when this is empty, which is a guess — this is the
     // creator's own answer.
     languages: { type: [String], default: [] },
+    // Demographic skew of who actually follows the creator — gender split,
+    // top locations and age-bracket breakdown. Entered from the internal
+    // Add Creator form's "Advance details" switch, shown on the campaign
+    // roster table behind "Advance stats", and only reaches a client's
+    // portal when that campaign's own shipAdvanceDetails flag is on (see
+    // CREATOR_PUBLIC in server.js — this field is deliberately left off the
+    // default allowlist there).
+    audience: {
+      gender: { male: Number, female: Number, other: Number },
+      locations: { type: [{ name: String, pct: Number, _id: false }], default: [] },
+      age: {
+        "13-17": Number, "18-24": Number, "25-34": Number, "35-44": Number, "45-64": Number,
+      },
+    },
     phone: String,
     payType: String,
     payId: String,

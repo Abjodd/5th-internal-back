@@ -11,6 +11,8 @@
 //   server.js         — split on write (POST/PATCH /api/campaigns), hydrate
 //                        on read (GET /api/campaigns, /api/portal/campaigns)
 //   routes/creators.js — the founder directory (PATCH edits the profile once)
+//   routes/pitch.js    — upserts a freshly-fetched pitch profile into the
+//                        directory (see upsertCreatorFromFetch below)
 //   scripts/normalize-creators.js — one-off migration for existing records
 import Creator from "./models/Creator.js";
 import { fetchRemoteAvatar, isAllowedAvatarSource } from "./remoteAvatar.js";
@@ -29,6 +31,10 @@ export const PROFILE_FIELDS = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
   "niche", "state", "languages", "phone", "payType", "payId", "vendorId",
   "managedBy", "personalDetails",
+  // Audience skew (gender/location/age) — a fact about the creator, not about
+  // one campaign's booking of them, so it belongs here next to niche/state.
+  // See models/Creator.js for the shape.
+  "audience",
 ];
 
 const pick = (obj, keys) => keys.reduce((o, k) => (k in (obj || {}) ? { ...o, [k]: obj[k] } : o), {});
@@ -164,4 +170,65 @@ export async function hydrateCampaignCreators(campaigns) {
     });
   }
   return campaigns;
+}
+
+// Every field a platform fetch (instagramfetchhiker.js's fetchInstagramProfile
+// shape) can supply, beyond the handful PROFILE_FIELDS keeps for a campaign
+// roster row — bio, following, post count, view average, verified/private/
+// business flags, external link. Used only by upsertCreatorFromFetch below.
+const FETCH_SET_FROM = (fetched) => ({
+  name: fetched.fullName ?? fetched.name ?? undefined,
+  handle: fetched.username ?? fetched.handle ?? undefined,
+  platform: "Instagram",
+  igUrl: (fetched.username || fetched.handle)
+    ? `https://instagram.com/${fetched.username || fetched.handle}`
+    : undefined,
+  followers: fetched.followers ?? undefined,
+  following: fetched.following ?? undefined,
+  posts: fetched.posts ?? undefined,
+  avgLikes: fetched.avgLikes ?? undefined,
+  avgComments: fetched.avgComments ?? undefined,
+  avgViews: fetched.avgViews ?? undefined,
+  avgER: fetched.engagementRate ?? fetched.avgER ?? undefined,
+  bio: fetched.bio ?? undefined,
+  externalUrl: fetched.externalUrl ?? undefined,
+  isVerified: fetched.isVerified ?? undefined,
+  isPrivate: fetched.isPrivate ?? undefined,
+  isBusiness: fetched.isBusiness ?? undefined,
+});
+
+/**
+ * Upsert a freshly-fetched profile into the creators directory, capturing
+ * everything the fetch returned rather than just the campaign-roster subset
+ * PROFILE_FIELDS keeps. Called from routes/pitch.js when a pitched influencer
+ * wasn't already in the directory, so pitching someone new to a client also
+ * makes them a first-class, searchable directory entry — not just a snapshot
+ * living on that one pitch.
+ *
+ * The core fields are written before this resolves (a caller building on the
+ * directory row right after should see them); the photo capture is fire-and-
+ * forget, same "capture once, best-effort" policy as captureMissingAvatars.
+ */
+export async function upsertCreatorFromFetch(key, fetched) {
+  if (!key || !fetched) return;
+  const set = FETCH_SET_FROM(fetched);
+  for (const k of Object.keys(set)) if (set[k] === undefined) delete set[k];
+
+  if (Object.keys(set).length) {
+    await Creator.updateOne({ _id: key }, { $set: set }, { upsert: true });
+  } else {
+    await Creator.updateOne({ _id: key }, { $setOnInsert: { _id: key } }, { upsert: true });
+  }
+
+  const photoUrl = fetched.profilePic;
+  if (photoUrl && isAllowedAvatarSource(photoUrl)) {
+    (async () => {
+      const existing = await Creator.findOne({ _id: key }, { avatarUpdatedAt: 1 }).lean();
+      if (existing?.avatarUpdatedAt) return;
+      const img = await fetchRemoteAvatar(photoUrl);
+      if (img) await Creator.updateOne({ _id: key }, { $set: { avatarImage: img, avatarUpdatedAt: new Date() } });
+    })().catch((err) => {
+      console.warn("[creatorSync] pitch avatar capture failed:", err.message);
+    });
+  }
 }

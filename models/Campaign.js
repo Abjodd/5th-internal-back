@@ -77,6 +77,11 @@ const CampaignSchema = new mongoose.Schema(
     creatorIds: { type: [String], default: [] },
     genRounds: Number,
     sentToClient: Boolean,
+    // Off by default — audience demographics only leave the building for a
+    // campaign the team has explicitly opted in, via the "Ship to client"
+    // switch on the Creators tab. See CAMPAIGN_PRIVATE/CREATOR_PUBLIC in
+    // server.js, which is what actually enforces this on the portal read.
+    shipAdvanceDetails: Boolean,
     internalNotes: String,
     timeline: { type: [mongoose.Schema.Types.Mixed], default: [] },
   },

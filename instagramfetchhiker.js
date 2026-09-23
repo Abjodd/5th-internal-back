@@ -32,7 +32,18 @@ function extractUsername(input) {
   return m ? m[1] : s;
 }
 
-// Fetch recent posts for a user and compute average likes/comments.
+// Only an actual video/Reel post (media_type 2 — HikerAPI mirrors Instagram's
+// own private-API media types: 1 photo, 2 video, 8 carousel) carries a real
+// view count. A photo or carousel post comes back with play_count: 0 rather
+// than the field being absent, so checking "is the field present" isn't
+// enough — averaging that 0 in with everything else drags a mostly-photo
+// account's avgViews toward zero even though it simply has no video to
+// measure. media_type is checked first; only then do we look across the
+// aliases a video's view count travels under (reel vs. feed video vs. IGTV).
+const isVideoPost = (p) => p?.media_type === 2;
+const viewsOf = (p) => (isVideoPost(p) ? p?.play_count ?? p?.ig_play_count ?? p?.view_count ?? null : null);
+
+// Fetch recent posts for a user and compute average likes/comments/views.
 // Returns nulls (not an error) if this call fails — profile data should
 // still be returned even if the likes lookup has a hiccup.
 async function fetchAverageEngagement(userId) {
@@ -46,7 +57,7 @@ async function fetchAverageEngagement(userId) {
     res = await fetch(url, { headers: { "x-access-key": TOKEN } });
   } catch (e) {
     log("medias network error:", e.message);
-    return { avgLikes: null, avgComments: null, sampleSize: 0 };
+    return { avgLikes: null, avgComments: null, avgViews: null, sampleSize: 0 };
   }
 
   const text = await res.text();
@@ -55,18 +66,21 @@ async function fetchAverageEngagement(userId) {
     posts = JSON.parse(text);
   } catch {
     log("medias non-JSON response:", text.slice(0, 300));
-    return { avgLikes: null, avgComments: null, sampleSize: 0 };
+    return { avgLikes: null, avgComments: null, avgViews: null, sampleSize: 0 };
   }
 
   if (res.status !== 200 || !Array.isArray(posts)) {
     log(`medias request failed status=${res.status}`, JSON.stringify(posts).slice(0, 300));
-    return { avgLikes: null, avgComments: null, sampleSize: 0 };
+    return { avgLikes: null, avgComments: null, avgViews: null, sampleSize: 0 };
   }
 
-  // `avg` filters non-numbers itself — see engagement.js.
+  // `avg` filters non-numbers itself — see engagement.js. Views only average
+  // over posts that actually carry a view count (reels/video); a feed of
+  // all-photo posts correctly comes back with avgViews: null rather than 0.
   return {
     avgLikes: avg(posts.map((p) => p.like_count)),
     avgComments: avg(posts.map((p) => p.comment_count)),
+    avgViews: avg(posts.map(viewsOf)),
     sampleSize: posts.length,
   };
 }
@@ -129,6 +143,7 @@ export async function fetchInstagramProfile(usernameOrUrl) {
     profilePic: body.profile_pic_url ?? null,
     avgLikes: null,
     avgComments: null,
+    avgViews: null,
     // Same key the YouTube fetcher returns and the Add Creator form reads into
     // avgER — one response shape for both platforms.
     engagementRate: null,
@@ -142,6 +157,7 @@ export async function fetchInstagramProfile(usernameOrUrl) {
     const engagement = await fetchAverageEngagement(profile.id);
     profile.avgLikes = engagement.avgLikes;
     profile.avgComments = engagement.avgComments;
+    profile.avgViews = engagement.avgViews;
     profile.engagementSampleSize = engagement.sampleSize;
     profile.engagementRate = engagementRate(profile);
   }

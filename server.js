@@ -13,6 +13,8 @@ import { carryTrackingHistory } from "./trackingHistory.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
 import careerRequestRoutes from "./routes/careerRequests.js";
+import pitchRoutes from "./routes/pitch.js";
+import pitchDraftRoutes from "./routes/pitchDrafts.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -69,6 +71,8 @@ app.use(creatorRoutes);
 app.use(clientRequestRoutes);
 app.use(creatorRequestRoutes);
 app.use(careerRequestRoutes);
+app.use(pitchRoutes);
+app.use(pitchDraftRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
@@ -636,6 +640,10 @@ const CAMPAIGN_PRIVATE = [
   // The fee's AMOUNT is the brand's to see; the rate it was agreed at is not —
   // read against the base budget it gives away the creator-pool split.
   "agencyFeePct",
+  // The switch itself, not what it controls — read (and stripped) below,
+  // before deletion, to decide whether "audience" joins CREATOR_PUBLIC for
+  // this campaign's creators.
+  "shipAdvanceDetails",
 ];
 
 // Creator fields are an ALLOWLIST, deliberately — the opposite of the campaign
@@ -675,6 +683,13 @@ const CREATOR_PUBLIC = [
   // call produced.
   "brandDecision",
 ];
+
+// Deliberately NOT in CREATOR_PUBLIC above: audience demographics are the
+// team's own research, not something every client should see by default.
+// Added to the allowlist per-request, below, only for a campaign whose own
+// shipAdvanceDetails flag is on — see the "Ship to client" switch on the
+// internal Creators tab.
+const CREATOR_ADVANCE = ["audience"];
 
 // Renamed on the way out, which is why it is not in the allowlist above: a
 // roster carries `cost` (what we pay — never leaves the building, it is half
@@ -761,11 +776,14 @@ app.get("/api/portal/campaigns", async (req, res) => {
     await hydrateCampaignCreators(campaigns);
     res.json(
       campaigns.map(({ _id, ...c }) => {
+        // Read before CAMPAIGN_PRIVATE strips it — the flag itself never
+        // reaches the client, only its effect on which creator fields do.
+        const creatorFields = c.shipAdvanceDetails ? [...CREATOR_PUBLIC, ...CREATOR_ADVANCE] : CREATOR_PUBLIC;
         for (const k of CAMPAIGN_PRIVATE) delete c[k];
         c.creators = (c.creators || []).map((cr) =>
           withRosterRef(
             withClientCost(
-              CREATOR_PUBLIC.reduce((safe, k) => (k in cr ? { ...safe, [k]: cr[k] } : safe), {}),
+              creatorFields.reduce((safe, k) => (k in cr ? { ...safe, [k]: cr[k] } : safe), {}),
               cr,
             ),
             cr,
