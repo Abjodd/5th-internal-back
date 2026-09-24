@@ -40,6 +40,10 @@ import { parsePdfUpload, sendPdf, OMIT_FILE } from "./pdfUpload.js";
 // for why images live inline on the document and are served from their own route.
 import { withAvatar, serveAvatar, OMIT_AVATAR, toBuffer } from "./avatarStore.js";
 import { suggestLogo } from "./faviconFetch.js";
+// Only needed here for DELETE /api/clients/:id's cascade — every other route
+// touching these lives in their own route modules (routes/auth.js, routes/pitch.js).
+import BrandCredential from "./models/BrandCredential.js";
+import PitchProfile from "./models/PitchProfile.js";
 const app = express();
 
 app.use(
@@ -1194,6 +1198,26 @@ app.get("/api/clients", async (req, res) => {
   }
 });
 
+// GET /api/clients/:id — one brand, fresh from the DB.
+//
+// Exists so the CLIENT PORTAL (a different app on this same backend) can
+// re-check its own brand's current name/logo without pulling the whole list
+// (which is every OTHER brand's name too — fine for the internal app's own
+// login-gated shell, not something a brand's browser session should fetch)
+// and without the portal user having to sign out and back in. The portal's
+// own login payload only takes a snapshot of hasAvatar/avatarUpdatedAt at
+// sign-in time (see portal-login in routes/auth.js), so a logo added after
+// that point never appeared until this existed.
+app.get("/api/clients/:id", async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id, OMIT_AVATAR).lean();
+    if (!client) return res.status(404).json({ error: "not found" });
+    res.json(clientPub(client));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/clients — create a new client
 app.post("/api/clients", async (req, res) => {
   try {
@@ -1225,6 +1249,55 @@ app.patch("/api/clients/:id", async (req, res) => {
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
     res.json(clientPub(updated));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/clients/:id — permanently removes a brand AND everything
+// scoped to it, not just the Client document. This is the one place "a
+// brand's data" is enumerated, so a new brand-scoped collection added later
+// needs a line here too:
+//   Campaign, BrandCredential (portal logins), Finding (Audit Centre),
+//   MarketWatchItem, NewsletterItem, Favourite, AccountQuestions (keyed by
+//   brandId as its own _id), PitchProfile, and the six billing collections
+//   (Invoice/Expense/PurchaseOrder/ClientPO/Quote/RegistryEntry).
+// Deliberately NOT touched: ReelCache and TrendingItem/NewsCache (shared,
+// not brand-scoped) and PitchDraft.promotedClientId (a soft, historical
+// link on a pre-sale record — clearing it would erase how that brand was
+// won, which isn't "the brand's data" the way a live campaign is).
+// Promise.allSettled, not Promise.all: one collection erroring must not
+// leave the brand half-deleted with everything else orphaned.
+app.delete("/api/clients/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const exists = await Client.exists({ _id: id });
+    if (!exists) return res.status(404).json({ error: "not found" });
+
+    const results = await Promise.allSettled([
+      Campaign.deleteMany({ brandId: id }),
+      BrandCredential.deleteMany({ brandId: id }),
+      Finding.deleteMany({ clientId: id }),
+      MarketWatchItem.deleteMany({ brandId: id }),
+      NewsletterItem.deleteMany({ brandId: id }),
+      Favourite.deleteMany({ brandId: id }),
+      AccountQuestions.deleteOne({ _id: id }),
+      PitchProfile.deleteMany({ brandId: id }),
+      Invoice.deleteMany({ brandId: id }),
+      Expense.deleteMany({ brandId: id }),
+      PurchaseOrder.deleteMany({ brandId: id }),
+      ClientPO.deleteMany({ brandId: id }),
+      Quote.deleteMany({ brandId: id }),
+      RegistryEntry.deleteMany({ brandId: id }),
+      Client.findByIdAndDelete(id),
+    ]);
+
+    const failed = results.filter(r => r.status === "rejected");
+    if (failed.length) {
+      console.error(`DELETE /api/clients/${id}: ${failed.length} cascade step(s) failed:`,
+        failed.map(f => f.reason?.message || f.reason));
+    }
+    res.status(204).end();
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
