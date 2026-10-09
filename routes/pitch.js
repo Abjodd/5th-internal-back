@@ -76,6 +76,7 @@ function publicShape(p, campaignName) {
     avgViews: p.avgViews ?? null,
     avgER: p.avgER ?? null,
     isVerified: !!p.isVerified,
+    campaignId: p.campaignId || null,
     campaignName: campaignName ?? p.campaignName ?? null,
     status: p.status,
     shipped: !!p.shipped,
@@ -128,6 +129,27 @@ async function campaignNamesFor(profiles) {
   if (!ids.length) return new Map();
   const campaigns = await Campaign.find({ _id: { $in: ids } }, { name: 1 }).lean();
   return new Map(campaigns.map((c) => [c._id, c.name]));
+}
+
+// Everything a pitch's existing campaign needs to show its own brief on the
+// public link, alongside what's been pitched for it — see the "IN PITCH for
+// an existing campaign I want the brief shown too" ask. Raw fields only
+// (brief/budget/stage/briefStatus): the shaping into the six-field view
+// (objective/targetAudience/keyMessages/deliverables/budget/timeline, locked
+// vs. pending) is campaignBriefView() in client-front's mapping.js — the
+// same function the real campaign detail page's Brief tab runs — so a brief
+// can't read differently on the two surfaces.
+async function campaignBriefsFor(profiles) {
+  const ids = [...new Set(profiles.map((p) => p.campaignId).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const campaigns = await Campaign.find(
+    { _id: { $in: ids } },
+    { name: 1, brief: 1, budget: 1, stage: 1, briefStatus: 1 },
+  ).lean();
+  return new Map(campaigns.map((c) => [
+    c._id,
+    { id: c._id, name: c.name, brief: c.brief ?? null, budget: c.budget ?? null, stage: c.stage ?? null, briefStatus: c.briefStatus ?? null },
+  ]));
 }
 
 /** Reads a brand's current pitchCode, minting one if it doesn't have one yet. */
@@ -438,11 +460,18 @@ router.get("/api/pitch/:brandId", async (req, res) => {
     const profiles = await PitchProfile.find({ brandId: req.params.brandId })
       .sort({ createdAt: 1 })
       .lean();
-    const nameById = await campaignNamesFor(profiles);
+    const [nameById, briefById] = await Promise.all([
+      campaignNamesFor(profiles),
+      campaignBriefsFor(profiles),
+    ]);
 
     res.json({
       client: { id: req.params.brandId, name: checked.client.name || null },
       profiles: profiles.map((p) => publicShape(p, nameById.get(p.campaignId) || null)),
+      // Keyed by campaign id, not inlined per profile — several profiles
+      // share one campaign and its brief, so this stays one copy rather than
+      // repeating the same brief object on every card pitched under it.
+      campaigns: Object.fromEntries(briefById),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
