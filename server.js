@@ -9,12 +9,14 @@ import invoicePdfRoutes from "./routes/invoicePdf.js";
 import authRoutes from "./routes/auth.js";
 import creatorRoutes from "./routes/creators.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
+import { parseFollowers } from "./followers.js";
 import { carryTrackingHistory } from "./trackingHistory.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
 import careerRequestRoutes from "./routes/careerRequests.js";
 import pitchRoutes from "./routes/pitch.js";
 import pitchDraftRoutes from "./routes/pitchDrafts.js";
+import avaRoutes from "./routes/ava.js";
 import Expense from "./models/Expense.js";
 import PurchaseOrder from "./models/PurchaseOrder.js";
 import ClientPO from "./models/ClientPO.js";
@@ -67,6 +69,9 @@ app.use(express.json({ limit: "5mb" }));
 // creators:   /api/creators — creator directory aggregated across campaigns
 // clientReqs: /api/client-requests — brand landing-page signups (founder inbox)
 // creatorReqs:/api/creator-requests — creator applications (founder inbox)
+// ava:        POST /api/ava/chat — the client portal's guide chatbot, proxied
+//             to Gemini (GEMINI_API_KEY in .env) so the key never reaches
+//             the browser. Stateless, no brand data in reach — see routes/ava.js.
 // NOTE: mounted before registerCrudRoutes("/api/invoices") below so the more
 // specific /pdf routes win over the generic /api/invoices/:id matchers.
 app.use(invoicePdfRoutes);
@@ -77,6 +82,7 @@ app.use(creatorRequestRoutes);
 app.use(careerRequestRoutes);
 app.use(pitchRoutes);
 app.use(pitchDraftRoutes);
+app.use(avaRoutes);
 
 // Generic CRUD route factory for the simple Billing collections — they're
 // all "list everything / create / patch by id", optionally filtered by
@@ -1412,20 +1418,10 @@ app.get("/api/post-metrics", async (req, res) => {
   }
 });
 
-// Follower counts are stored compact and inconsistently — the creators
-// directory keeps whatever was typed or scraped ("820K", "1.2M", "213001",
-// 11606, ""), so this normalizes all of it to a number. Anything it can't
-// parse is 0 rather than NaN, which would poison every sum downstream.
-function parseFollowers(raw) {
-  if (typeof raw === "number") return Number.isFinite(raw) ? raw : 0;
-  if (typeof raw !== "string") return 0;
-  const up = raw.trim().toUpperCase().replace(/,/g, "");
-  const mp = up.match(/^([\d.]+)\s*([KM])?$/);
-  if (!mp) return 0;
-  const n = parseFloat(mp[1]);
-  if (!Number.isFinite(n)) return 0;
-  return n * (mp[2] === "M" ? 1e6 : mp[2] === "K" ? 1e3 : 1);
-}
+// Moved to followers.js — now shared with routes/creators.js (Projects'
+// engagement-rate calc), which needed the same parser rather than a second
+// copy. Re-exported here under its old name so nothing else in this file
+// has to change.
 
 // ── Client Portal Analytics ─────────────────────────────────────────────────
 // GET /api/portal/reels?brand=BRANDID — the brand's live campaign posts, with

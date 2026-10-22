@@ -29,6 +29,7 @@
 import JobRun from "./models/JobRun.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import { refreshAllReels } from "./portalReels.js";
+import { refreshTrendingReels } from "./trendingReels.js";
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 // setTimeout clamps to a 32-bit ms delay (~24.9 days), so a daily gap is
@@ -86,6 +87,22 @@ const JOBS = [
     name: "portal-reels-refresh",
     hourIST: 1,
     run: refreshAllReels,
+  },
+  {
+    // Keeps Insights → Trending / Market Watch reels, and Managed Creator
+    // Projects, playable. Unlike the job above, nothing here rides a free
+    // call from elsewhere — every row across all three is a standalone
+    // HikerAPI credit every night, by design (see trendingReels.js) — so
+    // this just needs its own slot.
+    //
+    // 02:00, an hour behind portal-reels-refresh, keeps the three jobs that
+    // call HikerAPI (this one, that one, and post-metrics-refresh at
+    // midnight) from ever overlapping against the same rate-limited key,
+    // the same reasoning that put portal-reels-refresh an hour behind
+    // post-metrics-refresh.
+    name: "trending-reels-refresh",
+    hourIST: 2,
+    run: refreshTrendingReels,
   },
 ];
 

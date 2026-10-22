@@ -15,6 +15,10 @@ import { keyOf, PROFILE_FIELDS } from "../creatorSync.js";
 import { withAvatar, serveAvatar, OMIT_AVATAR } from "../avatarStore.js";
 import { parsePdfUpload, sendPdf, OMIT_FILE } from "../pdfUpload.js";
 import { applyRemoteAvatar } from "../remoteAvatar.js";
+import Project from "../models/Project.js";
+import { fetchReelSnapshot } from "../portalReels.js";
+import { engagementRate } from "../engagement.js";
+import { parseFollowers } from "../followers.js";
 
 // `hasAvatar` is derived from `avatarUpdatedAt`, not from the bytes — the list
 // query projects the bytes away, so the timestamp is the only witness left that
@@ -106,6 +110,40 @@ router.get("/api/creators", async (req, res) => {
 
     res.json(rows);
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/creators — a creator added straight to the directory, with no
+// campaign booking behind them yet. Until now a creator could only come to
+// exist here by being added to some campaign's roster (creatorSync.js) or
+// promoted from a creator application (routes/creatorRequests.js) — see the
+// frontend's Managed page (pages/Managed), which needed a way to add someone
+// a founder manages directly, before any campaign puts them on a roster.
+//
+// Accepts the same PROFILE_FIELDS shape the PATCH below edits, so the two
+// routes can never disagree about what a creator record holds.
+router.post("/api/creators", async (req, res) => {
+  try {
+    const key = keyOf(req.body);
+    if (!key) return res.status(400).json({ error: "name or handle is required" });
+    if (await Creator.exists({ _id: key }))
+      return res.status(409).json({ error: "A creator with this name/handle already exists." });
+
+    const patch = {};
+    for (const k of PROFILE_FIELDS) if (k in req.body) patch[k] = req.body[k];
+
+    try { withAvatar(patch, req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    if (!("avatarImage" in patch) && req.body.avatarSourceUrl)
+      await applyRemoteAvatar(patch, req.body.avatarSourceUrl);
+
+    const created = await Creator.create({ _id: key, ...patch });
+    res.status(201).json(pubAvatar({ id: key, ...created.toObject() }));
+  } catch (err) {
+    // A value the schema rejects (e.g. managedBy outside its enum) is the
+    // caller's mistake, not ours — 500 would have the frontend report an outage.
+    if (err.name === "ValidationError") return res.status(400).json({ error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
@@ -213,6 +251,155 @@ router.delete("/api/creators/:id/documents/:docId", async (req, res) => {
     const { deletedCount } = await CreatorDocument.deleteOne(docScope(req));
     if (!deletedCount) return res.status(404).json({ error: "not found" });
     res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PROJECTS ──────────────────────────────────────────────────────────────────
+// A standalone paid deal for a creator we manage directly — see
+// models/Project.js. Scoped by both ids, same discipline as the agreements
+// above: a project is only reachable through the creator that owns it.
+const projectScope = (req) => ({ _id: req.params.projectId, creatorId: creatorKey(req) });
+
+// ER is computed here, not stored — it is a ratio against the creator's
+// CURRENT follower count, which moves independently of when the project's
+// media was last fetched. Freezing it at fetch time would make an old
+// project's ER silently wrong the moment the creator's own numbers update.
+function withER(project, creator) {
+  const m = project.media;
+  if (!m?.ok) return project;
+  const followers = parseFollowers(creator?.followers);
+  return {
+    ...project,
+    media: { ...m, er: engagementRate({ avgLikes: m.likes, avgComments: m.comments, followers }) },
+  };
+}
+
+router.get("/api/creators/:id/projects", async (req, res) => {
+  try {
+    const creatorId = creatorKey(req);
+    const creator = await Creator.findById(creatorId, { followers: 1 }).lean();
+    const rows = await Project.find({ creatorId }).sort({ createdAt: -1 }).lean();
+    res.json(rows.map(({ _id, creatorId: _c, ...rest }) => withER({ id: _id, ...rest }, creator)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/api/creators/:id/projects", async (req, res) => {
+  try {
+    const creatorId = creatorKey(req);
+    const creator = await Creator.findById(creatorId, { followers: 1 });
+    if (!creator) return res.status(404).json({ error: "creator not found" });
+
+    // One HikerAPI credit, spent here and only here for a brand-new project —
+    // same one-fetch-at-save-time contract as POST /api/trending in
+    // server.js. The nightly job in trendingReels.js takes it from here.
+    const url = String(req.body.url || "").trim() || null;
+    const media = url ? await fetchReelSnapshot(url) : undefined;
+    const now = new Date();
+
+    const brand = String(req.body.brand || "").trim() || null;
+    const brandWebsite = String(req.body.brandWebsite || "").trim() || null;
+    const created = await Project.create({
+      _id: randomUUID(),
+      creatorId,
+      // No separate "project name" field any more — the brand IS the name a
+      // deal is known by; see pages/Managed/CampaignsTab.jsx. Kept on the
+      // document (not dropped from the schema) so older per-creator views
+      // and the Assets tab still have something to print as a caption.
+      name: String(req.body.name || "").trim() || brand || "Deal",
+      brand,
+      brandWebsite,
+      budget: Number(req.body.budget) || 0,
+      internalCost: Number(req.body.internalCost) || 0,
+      url,
+      ...(media ? { media, fetchedAt: media.ok ? now : null, attemptedAt: now } : {}),
+    });
+    const { _id, creatorId: _c, ...rest } = created.toObject();
+    res.status(201).json(withER({ id: _id, ...rest }, creator));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/api/creators/:id/projects/:projectId", async (req, res) => {
+  try {
+    const project = await Project.findOne(projectScope(req));
+    if (!project) return res.status(404).json({ error: "not found" });
+
+    const patch = {};
+    if ("name" in req.body) patch.name = String(req.body.name || "").trim() || "Deal";
+    if ("brand" in req.body) patch.brand = String(req.body.brand || "").trim() || null;
+    if ("brandWebsite" in req.body) patch.brandWebsite = String(req.body.brandWebsite || "").trim() || null;
+    if ("budget" in req.body) patch.budget = Number(req.body.budget) || 0;
+    if ("internalCost" in req.body) patch.internalCost = Number(req.body.internalCost) || 0;
+
+    // A changed link points at a different post — the old snapshot belongs
+    // to the link that's being replaced, so it's re-fetched rather than left
+    // sitting under a url it no longer describes.
+    if ("url" in req.body) {
+      const url = String(req.body.url || "").trim() || null;
+      patch.url = url;
+      if (url && url !== project.url) {
+        const media = await fetchReelSnapshot(url);
+        patch.media = media;
+        patch.fetchedAt = media.ok ? new Date() : null;
+        patch.attemptedAt = new Date();
+      }
+    }
+
+    project.set(patch);
+    await project.save();
+    const creator = await Creator.findById(project.creatorId, { followers: 1 }).lean();
+    const { _id, creatorId: _c, ...rest } = project.toObject();
+    res.json(withER({ id: _id, ...rest }, creator));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/api/creators/:id/projects/:projectId", async (req, res) => {
+  try {
+    const { deletedCount } = await Project.deleteOne(projectScope(req));
+    if (!deletedCount) return res.status(404).json({ error: "not found" });
+    res.status(204).end();
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/projects — every project across every creator, unscoped and
+// joined with just enough of each creator's own record (name, handle,
+// platform, current followers → ER) to stand alone. Billing's revenue-by-
+// source chart only ever needed {name,budget,creatorId,createdAt}; the
+// Managed Creators ecosystem (Summary/Campaigns/Assets tabs) is the reason
+// this now carries brand, the reel snapshot and the creator identity too —
+// one well-structured feed instead of three narrower ones that would each
+// need their own creator lookup repeated in the frontend.
+router.get("/api/projects", async (req, res) => {
+  try {
+    const rows = await Project.find({}).sort({ createdAt: -1 }).lean();
+    const creatorIds = [...new Set(rows.map(r => r.creatorId).filter(Boolean))];
+    const creators = await Creator
+      .find({ _id: { $in: creatorIds } }, { name: 1, handle: 1, platform: 1, followers: 1 })
+      .lean();
+    const creatorById = new Map(creators.map(c => [c._id, c]));
+
+    res.json(rows.map(({ _id, creatorId, ...rest }) => {
+      const creator = creatorById.get(creatorId);
+      const { media, ...fields } = withER(rest, creator);
+      return {
+        id: _id,
+        creatorId,
+        creatorName: creator?.name || null,
+        creatorHandle: creator?.handle || null,
+        creatorPlatform: creator?.platform || null,
+        ...fields,
+        media,
+      };
+    }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
