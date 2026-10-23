@@ -108,6 +108,14 @@ const PitchDraftSchema = new mongoose.Schema(
         isBusiness: Boolean,
         status: { type: String, default: "pending" }, // pending | approved | rejected
         decision: { at: Date, by: String },
+        // Once promoted: the real PitchProfile this candidate became on the
+        // new campaign. The client's link keeps working after promotion —
+        // decisions are written there (and mirrored here) — see
+        // linkPromotedProfiles in routes/pitchDrafts.js.
+        pitchProfileId: String,
+        // Pixel width of the stored photo — under 300 is Instagram's 150px
+        // thumbnail, which the editor offers to upgrade to HD.
+        avatarWidth: Number,
         _id: false,
       }],
       default: [],
@@ -116,6 +124,8 @@ const PitchDraftSchema = new mongoose.Schema(
     // The client's access code for THIS draft's own public link
     // (/pitch-draft/:id?code=...) — same lightweight code-gate model as a
     // real brand's Client.pitchCode, minted lazily on first profile added.
+    // Minted ONCE and never rotated: the link is meant to stay the same for
+    // as long as this pitch exists (deleting the draft is what ends it).
     pitchCode: String,
 
     status: { type: String, default: "draft" }, // draft | promoted

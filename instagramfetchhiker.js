@@ -85,6 +85,18 @@ async function fetchAverageEngagement(userId) {
   };
 }
 
+/** The sharpest profile photo URL the response offers. */
+export function pickProfilePic(body) {
+  if (!body) return null;
+  const versions = Array.isArray(body.hd_profile_pic_versions) ? body.hd_profile_pic_versions : [];
+  const biggest = versions.filter((v) => v?.url).sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+  return body.profile_pic_url_hd
+    || body.hd_profile_pic_url_info?.url
+    || biggest?.url
+    || body.profile_pic_url
+    || null;
+}
+
 export async function fetchInstagramProfile(usernameOrUrl) {
   if (!TOKEN) {
     return { error: "HIKERAPI_TOKEN not set in backend/.env" };
@@ -140,7 +152,11 @@ export async function fetchInstagramProfile(usernameOrUrl) {
     isBusiness: !!body.is_business,
     publicEmail: body.public_email ?? null,
     contactPhone: body.contact_phone_number ?? null,
-    profilePic: body.profile_pic_url ?? null,
+    // The HD photo first. `profile_pic_url` is Instagram's 150×150 thumbnail —
+    // fine for a 28px avatar, visibly blurry on a pitch card's full-width
+    // portrait. HikerAPI (instagrapi's user model) also carries the HD one
+    // (usually 320–1080px) under these names; the thumbnail is the fallback.
+    profilePic: pickProfilePic(body),
     avgLikes: null,
     avgComments: null,
     avgViews: null,

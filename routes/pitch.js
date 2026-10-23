@@ -343,45 +343,8 @@ router.delete("/api/campaigns/:id/pitch/:pitchId", async (req, res) => {
   }
 });
 
-// POST /api/campaigns/:id/pitch/code/regenerate — convenience wrapper: looks
-// up which brand this campaign belongs to and regenerates THAT brand's code
-// (see the canonical, brand-scoped version below) — invalidates the old
-// client link across every one of that brand's campaigns, not just this one,
-// since it's one link for the whole client.
-router.post("/api/campaigns/:id/pitch/code/regenerate", async (req, res) => {
-  try {
-    const campaign = await Campaign.findOne(
-      { _id: req.params.id, deleted: { $ne: true } },
-      { brandId: 1 },
-    ).lean();
-    if (!campaign) return res.status(404).json({ error: "campaign not found" });
-    if (!campaign.brandId) return res.status(400).json({ error: "This campaign has no brand to link to." });
-
-    const pitchCode = genCode();
-    await Client.updateOne({ _id: campaign.brandId }, { $set: { pitchCode } });
-    res.json({ pitchCode, brandId: campaign.brandId });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/clients/:id/pitch/code/regenerate — the canonical, brand-scoped
-// version of the above ("the old link is compromised / start a fresh round"),
-// for callers that already have the brand id in hand.
-router.post("/api/clients/:id/pitch/code/regenerate", async (req, res) => {
-  try {
-    const pitchCode = genCode();
-    const updated = await Client.findOneAndUpdate(
-      { _id: req.params.id },
-      { $set: { pitchCode } },
-      { new: true, fields: { pitchCode: 1 } },
-    ).lean();
-    if (!updated) return res.status(404).json({ error: "client not found" });
-    res.json({ pitchCode: updated.pitchCode });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// (No code/regenerate routes: a brand's pitch link is minted once by
+// ensurePitchCode and stays the same for good — one link per client.)
 
 // POST /api/campaigns/:id/pitch/:pitchId/ship — promote an approved pitch
 // into the campaign's real roster (Campaign.creators[]), one at a time, only
