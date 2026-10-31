@@ -17,6 +17,7 @@ import { parsePdfUpload, sendPdf, OMIT_FILE } from "../pdfUpload.js";
 import { applyRemoteAvatar } from "../remoteAvatar.js";
 import Project from "../models/Project.js";
 import { fetchReelSnapshot } from "../portalReels.js";
+import { notifyCampaign } from "../campaignSync.js";
 import { engagementRate } from "../engagement.js";
 import { parseFollowers } from "../followers.js";
 
@@ -184,6 +185,11 @@ router.patch("/api/creators/:id", async (req, res) => {
     });
     await inf.save();
     res.json(pubAvatar({ id: key, ...inf.toObject() }));
+    // The profile is shown on every campaign this creator is on — tell any
+    // app with one of those open so it re-reads instead of showing old details.
+    Campaign.find({ creatorIds: key, deleted: { $ne: true } }, { _id: 1 }).lean()
+      .then((list) => list.forEach((c) => notifyCampaign(c._id, { kind: "profile", creatorId: key })))
+      .catch(() => {});
   } catch (err) {
     // A value the schema rejects (e.g. managedBy outside its enum) is the
     // caller's mistake, not ours — 500 would have the frontend report an outage.

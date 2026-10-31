@@ -24,6 +24,44 @@ import Campaign from "./models/Campaign.js";
 import { fetchPostMetrics, RAW_MEDIA } from "./postMetrics.js";
 import { cacheReelFromMedia } from "./portalReels.js";
 import { withHistory } from "./trackingHistory.js";
+import { notifyCampaign } from "./campaignSync.js";
+
+const METRIC_KEYS = ["views", "likes", "comments", "forwards", "postsCounted", "lastFetched", "lastAutoRefresh"];
+
+/**
+ * Writes one row's fresh counts — and nothing else — onto the stored row.
+ *
+ * The job reads campaigns once and then spends minutes on HikerAPI. Writing
+ * back the whole creators[] it read at the start (as it used to) erased every
+ * edit the team made in those minutes. This re-reads the one row it is about
+ * to touch, extends ITS history, and writes only the metric keys, guarded by
+ * the row's rev so a save landing in between is re-read rather than lost.
+ */
+export async function writeRowMetrics(campaignId, rowRef, metrics) {
+  const now = new Date();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const match = rowRef._id != null ? { _id: rowRef._id } : { creatorId: rowRef.creatorId };
+    const doc = await Campaign.findOne({ _id: campaignId }, { creators: { $elemMatch: match } }).lean();
+    const cur = doc?.creators?.[0];
+    if (!cur) return false; // removed from the roster while we were fetching
+    const next = { ...(cur.tracking || {}), ...metrics };
+    const $set = { "creators.$[c].tracking.history": withHistory(cur.tracking?.history, next, now, cur.tracking) };
+    for (const k of METRIC_KEYS) if (k in metrics) $set[`creators.$[c].tracking.${k}`] = metrics[k];
+    $set["creators.$[c].rev"] = (cur.rev || 0) + 1;
+    const idKey = rowRef._id != null ? "c._id" : "c.creatorId";
+    const idVal = rowRef._id != null ? rowRef._id : rowRef.creatorId;
+    // A row whose tracking is still null can't take dotted keys — set it whole.
+    const update = cur.tracking == null || typeof cur.tracking !== "object"
+      ? { $set: { "creators.$[c].tracking": { ...next, history: $set["creators.$[c].tracking.history"] }, "creators.$[c].rev": $set["creators.$[c].rev"] }, $inc: { rev: 1 } }
+      : { $set, $inc: { rev: 1 } };
+    // Guarded in the query (not just the array filter) so a row someone saved
+    // in between makes this re-read instead of reporting a write that missed.
+    const elem = { [rowRef._id != null ? "_id" : "creatorId"]: idVal, rev: cur.rev == null ? { $exists: false } : cur.rev };
+    const res = await Campaign.updateOne({ _id: campaignId, creators: { $elemMatch: elem } }, update, { arrayFilters: [{ [idKey]: idVal }] });
+    if (res.modifiedCount) return true;
+  }
+  return false;
+}
 
 // Only campaigns with work in flight. Mirrors the frontend's finance track
 // (src/lib/campaign.js) plus every retired id that used to mean "delivering",
@@ -73,6 +111,7 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
   for (const camp of campaigns) {
     const creators = camp.creators || [];
     let changed = false;
+    let written = 0;
 
     for (const cr of creators) {
       const links = liveLinksOf(cr);
@@ -125,20 +164,15 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
       // outgoing tracking is passed too: on a creator that has no series yet it
       // seeds the first point, so the chart has something to draw one refresh
       // sooner than if the already-measured reading were simply discarded.
-      cr.tracking = {
-        ...next,
-        history: withHistory(cr.tracking?.history, next, new Date(), cr.tracking),
-      };
-      changed = true;
+      // Only the counts, onto the row as it is NOW — see writeRowMetrics.
+      const metrics = Object.fromEntries(METRIC_KEYS.filter((k) => k in next).map((k) => [k, next[k]]));
+      if (await writeRowMetrics(camp._id, cr, metrics)) { written++; changed = true; }
     }
 
     if (changed) {
-      // Writes creators[] only. A full document save would clobber whatever
-      // someone edited in the UI while this was running — the job holds a lean
-      // snapshot read minutes ago, and midnight is not a guarantee of an idle
-      // system.
-      await Campaign.updateOne({ _id: camp._id }, { $set: { creators } });
       touched++;
+      const fresh = await Campaign.findById(camp._id, { rev: 1 }).lean();
+      notifyCampaign(camp._id, { rev: fresh?.rev, kind: "metrics", by: "Nightly refresh", rows: written });
     }
   }
 

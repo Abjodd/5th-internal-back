@@ -11,6 +11,7 @@ import creatorRoutes from "./routes/creators.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
 import { parseFollowers } from "./followers.js";
 import { carryTrackingHistory } from "./trackingHistory.js";
+import { registerCampaignSyncRoutes, notifyCampaign, ensureRowIds } from "./campaignSync.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
 import careerRequestRoutes from "./routes/careerRequests.js";
@@ -468,6 +469,11 @@ app.patch("/api/account-questions/:brandId", async (req, res) => {
 
 // ── Campaigns ────────────────────────────────────────────────────────────────
 
+// Field-level writes + live updates (campaignSync.js). Registered first so
+// GET /api/campaigns/:id and the /creators, /fields, /timeline sub-routes win
+// over anything more generic below.
+registerCampaignSyncRoutes(app);
+
 // GET /api/campaigns — list all campaigns
 app.get("/api/campaigns", async (req, res) => {
   try {
@@ -535,10 +541,12 @@ app.post("/api/campaigns", async (req, res) => {
     const c = req.body;
     if (!c.id) return res.status(400).json({ error: "id is required" });
     const creators = await splitCreatorsForStorage(c.creators);
-    const doc = await Campaign.create({ ...c, _id: c.id, creators, creatorIds: creatorIdsOf(creators) });
+    const { rev: _r, editedBy: _e, ...body } = c;
+    const doc = await Campaign.create({ ...body, _id: c.id, rev: 1, creators: creators.map((r) => ({ ...r, rev: 1 })), creatorIds: creatorIdsOf(creators) });
     const [hydrated] = await hydrateCampaignCreators([doc.toObject()]);
     const { _id, ...rest } = hydrated;
     res.status(201).json({ id: _id, ...rest });
+    notifyCampaign(_id, { rev: 1, kind: "created", by: String(c.createdByName || "") || undefined });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ error: "A campaign with this id already exists." });
     res.status(500).json({ error: err.message });
@@ -551,6 +559,20 @@ app.post("/api/campaigns", async (req, res) => {
 app.patch("/api/campaigns/:id", async (req, res) => {
   try {
     const patch = { ...req.body };
+    // Whole-list writes are how edits used to vanish: the roster or timeline
+    // as one browser last saw it replaced whatever everyone else had saved
+    // since. Current app versions save row by row and append to the timeline
+    // (campaignSync.js), so a whole list arriving here comes from a tab opened
+    // before that shipped. Refuse it rather than let it overwrite — the user
+    // refreshes and carries on. ?legacy=1 keeps a deliberate escape hatch for
+    // one-off scripts.
+    if (("creators" in patch || "timeline" in patch) && req.query.legacy !== "1") {
+      return res.status(409).json({
+        error: "This page is out of date — refresh to keep editing. (Nothing was saved, so nobody else's changes were overwritten.)",
+        outdated: true,
+      });
+    }
+    delete patch.rev; delete patch.editedBy; delete patch._id; delete patch.id;
     if ("creators" in patch) {
       // The browser sends creators[] without tracking.history — it has no
       // reason to carry it — so writing the request straight through would
@@ -563,13 +585,14 @@ app.patch("/api/campaigns/:id", async (req, res) => {
     }
     const updated = await Campaign.findByIdAndUpdate(
       req.params.id,
-      { $set: patch },
+      { $set: patch, $inc: { rev: 1 } },
       { new: true }
     ).lean();
     if (!updated) return res.status(404).json({ error: "not found" });
     const [hydrated] = await hydrateCampaignCreators([updated]);
     const { _id, ...rest } = hydrated;
     res.json({ id: _id, ...rest });
+    notifyCampaign(_id, { rev: updated.rev, kind: "fields", paths: Object.keys(patch) });
 
     // A save is the moment a live post URL first exists in the system. Fetching
     // its media here — once, off the response path — is what lets the client
@@ -618,6 +641,7 @@ app.delete("/api/campaigns/:id", async (req, res) => {
       if (!campaign) return res.status(404).json({ error: "not found" });
       const { deletedCount } = await Expense.deleteMany({ campaign: id });
       console.log(`[campaigns] purged ${id} by ${actor} (+${deletedCount} expenses)`);
+      notifyCampaign(id, { kind: "removed", by: actor });
       return res.json({ purged: true, expensesDeleted: deletedCount });
     }
 
@@ -625,9 +649,11 @@ app.delete("/api/campaigns/:id", async (req, res) => {
     const archived = await Campaign.findByIdAndUpdate(id, {
       $set: { deleted: true, deletedAt: new Date() },
       $push: { timeline: { date, event: "Campaign archived", actor } },
+      $inc: { rev: 1 },
     }).lean();
     if (!archived) return res.status(404).json({ error: "not found" });
     res.status(204).end();
+    notifyCampaign(id, { kind: "removed", by: actor });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -851,12 +877,22 @@ async function appendAssetComment(match, ref, asset, { body, role, author, accou
     at: new Date().toISOString(),
     body, role, author, accountId,
   };
-  await Campaign.updateOne(match, { $push: { [`creators.$[c].${asset}.comments`]: comment } },
-    { arrayFilters: [{ "c._id": ref }] });
+  await Campaign.updateOne(match, {
+    $push: { [`creators.$[c].${asset}.comments`]: comment },
+    $inc: { rev: 1, "creators.$[c].rev": 1 },
+  }, { arrayFilters: [{ "c._id": ref }] });
+  touchedNotify(match._id, { kind: "comment", by: author, crId: ref });
 
   // The whole thread, not just the new note — either client would otherwise
   // miss a reply that landed while its page was open.
   return { asset, comment, comments: [...(row[asset]?.comments || []), comment] };
+}
+
+// The appends above already bumped `rev`; this only tells open apps.
+function touchedNotify(id, info) {
+  Campaign.findById(id, { rev: 1 }).lean()
+    .then((d) => notifyCampaign(id, { rev: d?.rev, ...info }))
+    .catch(() => {});
 }
 
 /** Shared validation, so both routes reject the same things the same way. */
@@ -964,9 +1000,16 @@ app.post("/api/portal/campaigns/:id/creators/:ref/decision", async (req, res) =>
     // would drop whatever it saved in between.
     await Campaign.updateOne(
       match,
-      { $set: { "creators.$[c].status": status, "creators.$[c].brandDecision": brandDecision } },
+      {
+        $set: {
+          "creators.$[c].status": status, "creators.$[c].brandDecision": brandDecision,
+          "creators.$[c].editedBy.status": { by: `${brandDecision.by} (client)`, at: brandDecision.at },
+        },
+        $inc: { rev: 1, "creators.$[c].rev": 1 },
+      },
       { arrayFilters: [{ "c._id": ref }] },
     );
+    touchedNotify(req.params.id, { kind: "creator", by: `${brandDecision.by} (client)`, crId: ref, paths: ["status"] });
 
     res.json({ status, brandDecision });
   } catch (err) {
@@ -1696,6 +1739,9 @@ const PORT = process.env.PORT || 4000;
 
 connectDB().then(() => {
   app.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
+  // One-off and idempotent: gives any roster row saved before row ids existed
+  // an _id, so every row can be edited on its own.
+  ensureRowIds().catch((e) => console.error("[campaignSync] ensureRowIds:", e.message));
   // After the DB is up — the jobs query Mongo directly.
   startScheduler();
 });

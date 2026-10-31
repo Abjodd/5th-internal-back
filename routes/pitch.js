@@ -28,6 +28,7 @@ import Creator from "../models/Creator.js";
 import PitchProfile from "../models/PitchProfile.js";
 import { fetchInstagramProfile } from "../instagramfetchhiker.js";
 import { keyOf, upsertCreatorFromFetch } from "../creatorSync.js";
+import { notifyCampaign } from "../campaignSync.js";
 
 const router = Router();
 
@@ -391,10 +392,14 @@ router.post("/api/campaigns/:id/pitch/:pitchId/ship", async (req, res) => {
       pitchId: pitch._id,
     };
 
-    await Campaign.updateOne(
+    // A $push, never a rewrite of creators[] — and the rev bump + notify let
+    // anyone with the campaign open see the new row without reloading.
+    const pushed = await Campaign.findOneAndUpdate(
       { _id: req.params.id },
-      { $push: { creators: row }, $addToSet: { creatorIds: key } },
-    );
+      { $push: { creators: { ...row, rev: 1 } }, $addToSet: { creatorIds: key }, $inc: { rev: 1 } },
+      { new: true, projection: { rev: 1 } },
+    ).lean();
+    notifyCampaign(req.params.id, { rev: pushed?.rev, kind: "creators-added", crIds: [row._id] });
 
     pitch.shipped = true;
     pitch.shippedAt = new Date();

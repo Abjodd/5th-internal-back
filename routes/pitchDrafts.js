@@ -50,6 +50,7 @@ import { imageSize } from "../imageSize.js";
 import { fetchInstagramProfile } from "../instagramfetchhiker.js";
 import { keyOf, upsertCreatorFromFetch } from "../creatorSync.js";
 import { fetchReelSnapshot } from "../portalReels.js";
+import { notifyCampaign } from "../campaignSync.js";
 
 const router = Router();
 
@@ -378,10 +379,11 @@ router.patch("/api/pitch-drafts/:id", async (req, res) => {
     if (promoted && draft.promotedCampaignId) {
       for (const [k, campKey] of Object.entries(CAMPAIGN_BRIEF_SYNC)) {
         if (!(k in patch) || patch[k] === draft[k]) continue;
-        await Campaign.updateOne(
+        const r = await Campaign.updateOne(
           { _id: draft.promotedCampaignId, [`brief.${campKey}`]: draft[k] ?? null },
-          { $set: { [`brief.${campKey}`]: patch[k] || null } },
-        ).catch(() => {});
+          { $set: { [`brief.${campKey}`]: patch[k] || null }, $inc: { rev: 1 } },
+        ).catch(() => null);
+        if (r?.modifiedCount) notifyCampaign(draft.promotedCampaignId, { kind: "fields", paths: [`brief.${campKey}`] });
       }
     }
     res.json(pubDraft(updated));
@@ -786,7 +788,9 @@ router.post("/api/pitch-drafts/:id/promote", async (req, res) => {
       timeline: [
         { date: today, event: "Campaign created from a pitch draft", actor: createdBy || "System" },
       ],
+      rev: 1,
     });
+    notifyCampaign(campaignId, { rev: 1, kind: "created" });
 
     // Every candidate carries over with the decision it has right now, and
     // is linked back so the client's link keeps working after this.
