@@ -106,7 +106,9 @@ const shape = (m) => ({
   // Reels/videos report play_count; a photo has neither, so views stays null.
   views: count(m.play_count, m.view_count),
   likes: count(m.like_count),
-  comments: count(m.comment_count),
+  // Some media objects carry the count under another name (or only the
+  // preview edge); without these the tile went blank on those posts.
+  comments: count(m.comment_count, m.comments_count, m.edge_media_to_comment?.count, m.edge_media_to_parent_comment?.count, m.edge_media_preview_comment?.count),
   // Instagram's own name for a forward/send is a "reshare".
   forwards: count(m.reshare_count, m.share_count),
   fetchedAt: new Date().toISOString(),
@@ -119,6 +121,14 @@ async function instagramPostMetrics(url) {
   const item = v2.ok ? v2.body?.items?.[0] : null;
   if (item) {
     const result = shape(item);
+    // v2 occasionally comes back without a comment count. v1 carries it, so
+    // spend one more call for that number rather than show a blank tile.
+    if (result.comments == null) {
+      const v1 = await hikerGet(IG_MEDIA_V1, url);
+      const c = v1.ok ? shape(v1.body).comments : null;
+      if (c != null) result.comments = c;
+      log("v2 had no comment count; v1 gave", c);
+    }
     if (DEBUG) log("v2 media", JSON.stringify(result));
     // Only v2 carries video_versions/image_versions2/caption, so only v2 can
     // feed the reel cache. A v1 fallback returns counts alone and the reels

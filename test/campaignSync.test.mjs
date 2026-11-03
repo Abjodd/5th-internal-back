@@ -177,6 +177,22 @@ await test("comments and history can't be written through a row patch", async ()
   assert.equal(h.status, 400);
 });
 
+await test("the comment COUNT from Refresh saves and is seen by everyone (threads stay protected)", async () => {
+  // what Refresh sends: the four counts together
+  const r = await patchRow("c1", "cr_a", { "tracking.views": 60400, "tracking.likes": 1000, "tracking.comments": 87, "tracking.forwards": 43 }, null, "Riya");
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  // a reload / a second person reads it back
+  const t = row(await get("c1"), "cr_a").tracking;
+  assert.equal(t.comments, 87);
+  assert.equal(t.views, 60400);
+  // a later Refresh updates it like any other count; a real 0 is kept
+  await patchRow("c1", "cr_a", { "tracking.comments": 0 }, null, "Karan");
+  assert.equal(row(await get("c1"), "cr_a").tracking.comments, 0);
+  // never a thread under this name, and the asset threads are still closed
+  assert.equal((await patchRow("c1", "cr_a", { "tracking.comments": [{ text: "x" }] }, null, "X")).status, 400);
+  assert.equal((await patchRow("c1", "cr_a", { "demo.comments": [] }, null, "X")).status, 400);
+});
+
 await test("profile fields go to the directory, not the row", async () => {
   const r = await patchRow("c1", "cr_a", { followers: "150K", state: "Goa" }, { followers: "120K" }, "Riya");
   assert.equal(r.status, 200, JSON.stringify(r.body));

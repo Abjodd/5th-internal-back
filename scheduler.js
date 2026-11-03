@@ -67,6 +67,11 @@ const JOBS = [
     name: "post-metrics-refresh",
     hourIST: 0, // midnight IST
     run: refreshAllPostMetrics,
+    // Deliverables numbers change at 12 am and when someone presses Refresh —
+    // nothing else (team decision, 3 Nov). A server that was down at midnight
+    // used to "catch up" whenever it next started, so numbers moved at odd
+    // hours; now a missed night simply waits for the next one or a Refresh.
+    catchUp: false,
   },
   {
     // Keeps the client portal's Reels shelf playable. Instagram signs its CDN
@@ -179,6 +184,6 @@ export function startScheduler() {
   }
   JOBS.forEach((job) => {
     schedule(job);
-    catchUp(job);
+    if (job.catchUp !== false) catchUp(job);
   });
 }

@@ -26,7 +26,7 @@ import { cacheReelFromMedia } from "./portalReels.js";
 import { withHistory } from "./trackingHistory.js";
 import { notifyCampaign } from "./campaignSync.js";
 
-const METRIC_KEYS = ["views", "likes", "comments", "forwards", "postsCounted", "lastFetched", "lastAutoRefresh"];
+const METRIC_KEYS = ["views", "likes", "comments", "forwards", "postsCounted", "lastFetched", "lastFetchedAt", "lastFetchedBy", "lastAutoRefresh"];
 
 /**
  * Writes one row's fresh counts — and nothing else — onto the stored row.
@@ -147,16 +147,24 @@ export async function refreshAllPostMetrics({ log = console.log } = {}) {
 
       // null stays null: YouTube exposes no forward count, and summing that as
       // 0 would report a real zero rather than "not measured".
+      // A count none of the links reported this time keeps the last known one
+      // (same number of posts measured) instead of blanking it — one reply
+      // from Instagram without a comment count used to wipe the tile.
+      const prev = cr.tracking || {};
       const sum = (k) => (results.some((m) => m[k] != null)
         ? results.reduce((s, m) => s + (m[k] || 0), 0)
-        : null);
+        : (prev[k] != null && (prev.postsCounted || 1) === results.length ? prev[k] : null));
 
       const next = {
         ...(cr.tracking || {}),
         views: sum("views"), likes: sum("likes"),
         comments: sum("comments"), forwards: sum("forwards"),
         postsCounted: results.length,
-        lastFetched: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
+        // In IST: the server's clock is UTC, so the midnight run used to be
+        // stamped "06:30 pm" and read as if it hadn't happened at 12 am.
+        lastFetched: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }),
+        lastFetchedAt: new Date().toISOString(),
+        lastFetchedBy: "Nightly refresh",
         lastAutoRefresh: new Date().toISOString(),
       };
       // Recorded before the overwrite, so each night's reading survives as a

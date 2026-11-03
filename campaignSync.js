@@ -66,15 +66,26 @@ const metaKey = (path) => path.replace(/\./g, "__");
 // comment threads (their own route appends to them) or the metrics history.
 const ROW_BLOCK = /(^|\.)(_id|rev|creatorId|editedBy|comments|history)(\.|$)|\$/;
 const ROW_PATH = /^[A-Za-z][\w]*(\.[A-Za-z][\w]*)?$/;
+// …except the post's comment COUNT. "tracking.comments" is a number that
+// Refresh writes next to views/likes/forwards — not a thread — and blocking it
+// with the threads meant it never saved: it showed for the person who pressed
+// Refresh and was "—" after a reload or for anyone else. Numbers only, so a
+// thread can't be smuggled in under this name.
+const ROW_NUMBER_OK = new Set(["tracking.comments"]);
 // Campaign-level paths. Arrays and identity that have their own routes are out.
 const FIELD_BLOCK = /^(_id|id|rev|creators|creatorIds|timeline|deleted|editedBy)(\.|$)|\$/;
 const FIELD_PATH = /^[A-Za-z][\w]*(\.[A-Za-z][\w]*){0,2}$/;
 
 class HttpError extends Error { constructor(status, body) { super(body?.error || "error"); this.status = status; this.body = body; } }
 
-function cleanSet(set, allowPath, block) {
+function cleanSet(set, allowPath, block, numberOk = null) {
   if (!isObj(set) || !Object.keys(set).length) throw new HttpError(400, { error: "Nothing to save." });
   for (const p of Object.keys(set)) {
+    if (numberOk?.has(p)) {
+      const v = set[p];
+      if (v === null || (typeof v === "number" && Number.isFinite(v))) continue;
+      throw new HttpError(400, { error: `Field "${p}" must be a number.` });
+    }
     if (!allowPath.test(p) || block.test(p)) throw new HttpError(400, { error: `Field "${p}" can't be changed here.` });
   }
   return set;
@@ -168,7 +179,7 @@ export async function publicCampaign(id) {
 
 /** One roster row, field by field. */
 export async function patchCreatorRow(campaignId, crId, { set, from, force, actor }) {
-  cleanSet(set, ROW_PATH, ROW_BLOCK);
+  cleanSet(set, ROW_PATH, ROW_BLOCK, ROW_NUMBER_OK);
   const profilePaths = Object.keys(set).filter((p) => PROFILE_FIELDS.includes(p.split(".")[0]));
   const rowPaths = Object.keys(set).filter((p) => !profilePaths.includes(p));
   const now = new Date();
