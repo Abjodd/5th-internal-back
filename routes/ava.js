@@ -59,7 +59,7 @@ export const ROUTES = [
   { path: "/portal/regional", label: "Regional", authed: true, desc: "A map of where this brand's own creators actually are, by Indian state/region, with a drill-down into each state's roster." },
   { path: "/portal/assets", label: "Content", authed: true, desc: "A register of every piece of content posted across this brand's campaigns — the content archive." },
   { path: "/portal/billing", label: "Billing", authed: true, desc: "The exact cost breakdown of every campaign, line by line — what each creator was paid and the agency fee, meant to be read alongside an invoice." },
-  { path: "/portal/insights", label: "Insights", authed: true, desc: "Open questions for the brand to answer, trending content in their space, Fifth Avenue's Market Watch notes, and the newsletter." },
+  { path: "/portal/insights", label: "Insights", authed: true, desc: "Open questions for the brand to answer, Audience Voice (what people said in the comments on their campaign posts — sentiment, themes, questions, buying intent), trending content in their space, Fifth Avenue's Market Watch notes, and the newsletter." },
   { path: "/portal/profile", label: "Profile", authed: true, desc: "Account settings — who's signed in, portal appearance (light/dark), and the company record Fifth Avenue holds for this brand." },
 ];
 

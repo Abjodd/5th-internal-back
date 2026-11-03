@@ -12,6 +12,7 @@ import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creat
 import { parseFollowers } from "./followers.js";
 import { carryTrackingHistory } from "./trackingHistory.js";
 import { registerCampaignSyncRoutes, notifyCampaign, ensureRowIds } from "./campaignSync.js";
+import { refreshBrandInsights, getBrandInsights, getBrandInsightsStatus } from "./commentInsights.js";
 import clientRequestRoutes from "./routes/clientRequests.js";
 import creatorRequestRoutes from "./routes/creatorRequests.js";
 import careerRequestRoutes from "./routes/careerRequests.js";
@@ -1484,6 +1485,47 @@ app.get("/api/portal/reels", async (req, res) => {
     const scope = await resolveBrandScope(req.query);
     if (!requireBrandScope(res, scope)) return;
     res.json({ reels: await getClientReels(scope) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/portal/comment-insights?brand=BRANDID — what people said in the
+// comments on the brand's campaign posts (Insights → Audience voice).
+//
+// A read of the stored analysis and nothing else: comments are fetched and
+// analysed by the weekly job and the internal Refresh button (see
+// commentInsights.js), never because a client opened a page. Commenter
+// usernames and comment text are already public on the posts themselves.
+app.get("/api/portal/comment-insights", async (req, res) => {
+  try {
+    const scope = await resolveBrandScope(req.query);
+    if (!requireBrandScope(res, scope)) return;
+    res.json(await getBrandInsights(scope.id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/comment-insights/:brandId — status for the internal app's Refresh
+// control (last run, totals, whether one is running).
+app.get("/api/comment-insights/:brandId", async (req, res) => {
+  try {
+    res.json(await getBrandInsightsStatus(req.params.brandId));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/comment-insights/:brandId/refresh { force? } — fetch and analyse
+// now. Answers at once (202) and runs in the background; poll the GET above.
+// `force` re-buys comments fetched within the last week too.
+app.post("/api/comment-insights/:brandId/refresh", async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) return res.status(503).json({ error: "GEMINI_API_KEY is not set on the backend" });
+    refreshBrandInsights(req.params.brandId, { force: !!req.body?.force }).catch((e) => console.error("[comments]", e.message));
+    await new Promise((r) => setTimeout(r, 150)); // let the run claim its status
+    res.status(202).json(await getBrandInsightsStatus(req.params.brandId));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -124,15 +124,47 @@ router.get("/api/creators", async (req, res) => {
 //
 // Accepts the same PROFILE_FIELDS shape the PATCH below edits, so the two
 // routes can never disagree about what a creator record holds.
+// Everything Find Creators knew about a profile when it was added — stored per
+// platform under `socials.<platform>`, so one creator can carry their
+// Instagram, YouTube, TikTok, X… details side by side. Kept to plain JSON
+// values and a sane size; the profile fields above stay the editable truth.
+const SOCIAL_PLATFORMS = new Set(["instagram", "youtube", "tiktok", "facebook", "x", "linkedin"]);
+function cleanDiscovery(d) {
+  if (!d || typeof d !== "object" || !SOCIAL_PLATFORMS.has(String(d.platform))) return null;
+  const out = JSON.parse(JSON.stringify(d)); // drops functions/undefined, copies
+  delete out.avatarImage;
+  if (JSON.stringify(out).length > 40_000) return null;
+  return { ...out, savedAt: new Date().toISOString() };
+}
+
 router.post("/api/creators", async (req, res) => {
   try {
     const key = keyOf(req.body);
     if (!key) return res.status(400).json({ error: "name or handle is required" });
-    if (await Creator.exists({ _id: key }))
-      return res.status(409).json({ error: "A creator with this name/handle already exists." });
+    const discovery = cleanDiscovery(req.body.discovery);
+
+    // The directory is keyed by handle, so the same handle on another platform
+    // is treated as the same creator. Say who is already there, so the app can
+    // tell "already added" apart from "this handle belongs to their Instagram".
+    const existing = await Creator.findById(key, { name: 1, platform: 1 }).lean();
+    if (existing) {
+      // From Find Creators: keep what was found, on the existing creator, under
+      // its own platform — their profile fields are left exactly as they were.
+      if (discovery) {
+        await Creator.updateOne({ _id: key }, { $set: { [`socials.${discovery.platform}`]: discovery } });
+        const saved = await Creator.findById(key, OMIT_AVATAR).lean();
+        const { _id, ...rest } = saved;
+        return res.status(200).json({ ...pubAvatar({ id: _id, ...rest }), linked: true, existing: { id: key, name: existing.name || null, platform: existing.platform || null } });
+      }
+      return res.status(409).json({
+        error: "A creator with this name/handle already exists.",
+        existing: { id: key, name: existing.name || null, platform: existing.platform || null },
+      });
+    }
 
     const patch = {};
     for (const k of PROFILE_FIELDS) if (k in req.body) patch[k] = req.body[k];
+    if (discovery) patch.socials = { [discovery.platform]: discovery };
 
     try { withAvatar(patch, req.body); }
     catch (e) { return res.status(400).json({ error: e.message }); }

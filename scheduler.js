@@ -30,6 +30,7 @@ import JobRun from "./models/JobRun.js";
 import { refreshAllPostMetrics } from "./refreshPostMetrics.js";
 import { refreshAllReels } from "./portalReels.js";
 import { refreshTrendingReels } from "./trendingReels.js";
+import { refreshAllCommentInsights } from "./commentInsights.js";
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 // setTimeout clamps to a 32-bit ms delay (~24.9 days), so a daily gap is
@@ -103,6 +104,16 @@ const JOBS = [
     name: "trending-reels-refresh",
     hourIST: 2,
     run: refreshTrendingReels,
+  },
+  {
+    // Insights → Audience voice: comments on every brand's live posts, read by
+    // Gemini. Checked nightly but WEEKLY in effect — it only touches brands
+    // whose analysis is older than COMMENTS_REFRESH_DAYS (7), and a post's
+    // comments are re-bought at most that often. 03:00 keeps it off the
+    // HikerAPI key while the three jobs above run. See commentInsights.js.
+    name: "comment-insights-refresh",
+    hourIST: 3,
+    run: refreshAllCommentInsights,
   },
 ];
 

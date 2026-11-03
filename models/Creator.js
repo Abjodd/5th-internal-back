@@ -69,6 +69,11 @@ const CreatorSchema = new mongoose.Schema(
     // kept. NEVER returned by the list route; see OMIT_AVATAR in
     // routes/creators.js.
     ...AVATAR_FIELDS,
+    // Everything Find Creators knew about the creator on each platform when
+    // they were added: { instagram: {...}, youtube: {...}, x: {...} } with
+    // bio, followers, following, posts, likes, verified, links, email, the
+    // platform's own id and extras. See cleanDiscovery in routes/creators.js.
+    socials: mongoose.Schema.Types.Mixed,
   },
   { strict: false, versionKey: false, timestamps: true }
 );
