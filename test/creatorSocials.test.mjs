@@ -56,6 +56,24 @@ await test("unknown platform or oversized data isn't stored", async () => {
   assert.equal(c.socials, undefined);
 });
 
+await test("country / state / city and niche are saved, and fill only blanks on a linked creator", async () => {
+  const r = await post({ name: "Anu", handle: "@anu.kochi", platform: "Instagram", niche: "Mom, Parenting", country: "India", state: "Kerala", city: "Kochi",
+    discovery: { platform: "instagram", username: "anu.kochi", place: { country: "India", state: "Kerala", city: "Kochi" } } });
+  assert.equal(r.status, 201);
+  let c = (await (await fetch(`${API}/api/creators`)).json()).find((x) => x.id === "@anu.kochi");
+  assert.deepEqual([c.country, c.state, c.city, c.niche], ["India", "Kerala", "Kochi", "Mom, Parenting"]);
+  // Riya (YouTube) has no niche or place yet — linking her TikTok fills them; a second link never overwrites.
+  await post({ name: "Riya", handle: "@riyavlogs", platform: "TikTok", niche: "Food", country: "India", state: "Maharashtra", city: "Pune", discovery: { platform: "tiktok", username: "riyavlogs" } });
+  await post({ name: "Riya", handle: "@riyavlogs", platform: "Facebook", niche: "Travel", country: "UAE", city: "Dubai", discovery: { platform: "facebook", username: "riyavlogs" } });
+  c = (await (await fetch(`${API}/api/creators`)).json()).find((x) => x.id === "@riyavlogs");
+  assert.deepEqual([c.niche, c.country, c.state, c.city, c.name, c.platform], ["Food", "India", "Maharashtra", "Pune", "Riya", "YouTube"]);
+  // and the Edit form can change them like any profile field
+  const u = await fetch(`${API}/api/creators/@riyavlogs`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ country: "UAE", state: "", city: "Dubai" }) });
+  assert.equal(u.status, 200);
+  c = (await (await fetch(`${API}/api/creators`)).json()).find((x) => x.id === "@riyavlogs");
+  assert.deepEqual([c.country, c.city], ["UAE", "Dubai"]);
+});
+
 server.kill();
 await mongoose.connection.db.dropDatabase(); await mongoose.disconnect();
 console.log(`\n${passed} passed`);

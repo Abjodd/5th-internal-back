@@ -151,7 +151,16 @@ router.post("/api/creators", async (req, res) => {
       // From Find Creators: keep what was found, on the existing creator, under
       // its own platform — their profile fields are left exactly as they were.
       if (discovery) {
-        await Creator.updateOne({ _id: key }, { $set: { [`socials.${discovery.platform}`]: discovery } });
+        // …except blanks: a niche or location nobody has filled in yet is
+        // taken from what was found, so the Creators tab can filter on it.
+        // Anything already there is never overwritten.
+        const cur = await Creator.findById(key, { niche: 1, country: 1, state: 1, city: 1 }).lean();
+        const fill = {};
+        for (const k of ["niche", "country", "state", "city"]) {
+          const v = typeof req.body[k] === "string" ? req.body[k].trim() : "";
+          if (v && !String(cur?.[k] || "").trim()) fill[k] = v;
+        }
+        await Creator.updateOne({ _id: key }, { $set: { [`socials.${discovery.platform}`]: discovery, ...fill } });
         const saved = await Creator.findById(key, OMIT_AVATAR).lean();
         const { _id, ...rest } = saved;
         return res.status(200).json({ ...pubAvatar({ id: _id, ...rest }), linked: true, existing: { id: key, name: existing.name || null, platform: existing.platform || null } });

@@ -29,7 +29,7 @@ export const keyOf = (cr) => String(cr?.handle || cr?.name || "").toLowerCase().
 // of one booking, so it is set once in the directory and every campaign reads it.
 export const PROFILE_FIELDS = [
   "name", "handle", "platform", "igUrl", "followers", "avgLikes", "avgER",
-  "niche", "state", "languages", "phone", "payType", "payId", "vendorId",
+  "niche", "country", "state", "city", "languages", "phone", "payType", "payId", "vendorId",
   "managedBy", "personalDetails",
   // Audience skew (gender/location/age) — a fact about the creator, not about
   // one campaign's booking of them, so it belongs here next to niche/state.

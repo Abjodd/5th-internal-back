@@ -25,7 +25,13 @@ const CreatorSchema = new mongoose.Schema(
     avgLikes: mongoose.Schema.Types.Mixed,
     avgER: Number,
     niche: String,
+    // Where they are: country, state/region, city. `state` is the original
+    // field (Indian states, from the Add Creator form); country and city came
+    // with Find creators, which works out all three — the Creators tab
+    // filters on them.
+    country: String,
     state: String,
+    city: String,
     // Languages the creator publishes in. Collected on the public application
     // form (models/CreatorRequest.js) and carried across on promotion. The
     // client portal's Regional Map falls back to the primary language of the
