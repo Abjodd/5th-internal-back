@@ -10,7 +10,8 @@
     "seed:billing": "node seed_billing.js",
     "seed:users": "node seed_users.js",
     "seed:client-requests": "node scrap/seed_client_requests.js",
-    "seed:all": "node seed_all.js && node seed_users.js"
+    "seed:all": "node seed_all.js && node seed_users.js",
+    "seed:consultant-demo": "node seed_demo_consultant.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -10,6 +10,9 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import User from "../models/User.js";
 import BrandCredential from "../models/BrandCredential.js";
+import ConsultantCredential from "../models/ConsultantCredential.js";
+import Consultant from "../models/Consultant.js";
+import { issueToken, TOKEN_DAYS } from "../consultantToken.js";
 import Client from "../models/Client.js";
 // Profile photos: parsing, the 2MB cap and the serve route are shared with the
 // clients collection (brand logos) — see avatarStore.js.
@@ -72,7 +75,7 @@ async function nextInSequence(Model, prefix, field = "_id") {
   }, 0);
   return `${prefix}${max + 1}`;
 }
-const ID_PREFIX = new Map([[User, "u"], [BrandCredential, "bc"]]);
+const ID_PREFIX = new Map([[User, "u"], [BrandCredential, "bc"], [ConsultantCredential, "cc"]]);
 
 // Shared login handler: verify email + password hash against a collection.
 // `extra` may be async and enriches the response; returning null/undefined
@@ -382,5 +385,34 @@ function registerAuthCrudRoutes(basePath, Model) {
 
 registerAuthCrudRoutes("/api/users", User);
 registerAuthCrudRoutes("/api/brand-credentials", BrandCredential);
+// Consultant portal logins — Settings → Consultant Login. Same contract as the
+// brand ones; each is scoped to one consultant by consultantId.
+registerAuthCrudRoutes("/api/consultant-credentials", ConsultantCredential);
+
+// POST /api/auth/consultant-login — for the consultant portal (built later).
+// Resolves the login to its consultant and returns who they are and which
+// brands they hold; a login whose consultant was removed or set inactive fails
+// closed.
+router.post("/api/auth/consultant-login", loginHandler(
+  ConsultantCredential,
+  async (doc) => {
+    const c = await Consultant.findById(doc.consultantId, { name: 1, status: 1, brandIds: 1, avatarUpdatedAt: 1 }).lean();
+    if (!c || c.status === "inactive") return null;
+    const firstLogin = !doc.firstLoginAt;
+    if (firstLogin) {
+      try { await ConsultantCredential.updateOne({ _id: doc._id }, { $set: { firstLoginAt: new Date() } }); }
+      catch (err) { console.warn("[consultant-login] could not stamp firstLoginAt for", doc._id, err.message); }
+    }
+    // `token` is what the portal sends on every /api/consultant-portal call
+    // (see consultantToken.js) — it, not anything the browser says, decides
+    // whose record the portal can read.
+    return {
+      consultantId: c._id, consultantName: c.name, brandIds: c.brandIds || [], firstLogin,
+      consultantHasAvatar: !!c.avatarUpdatedAt, consultantAvatarUpdatedAt: c.avatarUpdatedAt || null,
+      token: issueToken(doc._id, c._id), tokenDays: TOKEN_DAYS,
+    };
+  },
+  "This login isn't linked to an active consultant."
+));
 
 export default router;

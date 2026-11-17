@@ -8,6 +8,9 @@ import Invoice from "./models/Invoice.js";
 import invoicePdfRoutes from "./routes/invoicePdf.js";
 import authRoutes from "./routes/auth.js";
 import creatorRoutes from "./routes/creators.js";
+import consultantRoutes from "./routes/consultants.js";
+import consultantPortalRoutes from "./routes/consultantPortal.js";
+import Consultant from "./models/Consultant.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
 import { parseFollowers } from "./followers.js";
 import { carryTrackingHistory } from "./trackingHistory.js";
@@ -79,6 +82,8 @@ app.use(express.json({ limit: "5mb" }));
 app.use(invoicePdfRoutes);
 app.use(authRoutes);
 app.use(creatorRoutes);
+app.use(consultantRoutes);
+app.use(consultantPortalRoutes);
 app.use(clientRequestRoutes);
 app.use(creatorRequestRoutes);
 app.use(careerRequestRoutes);
@@ -1327,6 +1332,8 @@ app.delete("/api/clients/:id", async (req, res) => {
     const results = await Promise.allSettled([
       Campaign.deleteMany({ brandId: id }),
       BrandCredential.deleteMany({ brandId: id }),
+      // Consultants keep their record; they just stop holding this brand.
+      Consultant.updateMany({ brandIds: id }, { $pull: { brandIds: id } }),
       Finding.deleteMany({ clientId: id }),
       MarketWatchItem.deleteMany({ brandId: id }),
       NewsletterItem.deleteMany({ brandId: id }),
