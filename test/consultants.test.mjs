@@ -222,6 +222,29 @@ await test("deleting a brand takes it off consultants; deleting a consultant rem
   assert.equal((await call("POST", "/api/auth/consultant-login", { email: "rohan@kapoor.in", password: "s3cret-Pass" })).status, 401);
 });
 
+await test("brand details (Settings → Brand Settings) are cleaned like a consultant's; the logo and other fields stay", async () => {
+  await db.collection("clients").insertOne({ _id: "dets", name: "Details Co", website: "details.co", avatarUpdatedAt: new Date() });
+  const r = await call("PATCH", "/api/clients/dets", {
+    billing: { gstNumber: "27aapfu0939f1zv", address: " 1 Linking Rd ", gst: "", email: "Bills@Details.co", junk: "x" },
+    hq: { address: "Andheri", gst: "27AAPFU0939F1ZV" }, tax: { tin: "27123456789", pan: "abcde1234f" },
+    primaryContact: { name: "Asha", designation: "CMO", email: "asha@details.co", phone: "+91 90000 00000" },
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.deepEqual(r.body.billing, { gstNumber: "27AAPFU0939F1ZV", address: "1 Linking Rd", gst: "", email: "bills@details.co" });
+  assert.equal(r.body.tax.pan, "ABCDE1234F");
+  assert.ok(r.body.primaryContact._id);
+  assert.equal(r.body.website, "details.co");
+  assert.equal(r.body.hasAvatar, true);
+  for (const [body, words] of [[{ tax: { pan: "nope" } }, /PAN/], [{ hq: { gst: "BAD" } }, /HQ GST/], [{ primaryContact: { email: "x" } }, /email/i]]) {
+    const bad = await call("PATCH", "/api/clients/dets", body);
+    assert.equal(bad.status, 400, JSON.stringify(body));
+    assert.match(bad.body.error, words);
+  }
+  const plain = await call("PATCH", "/api/clients/dets", { name: "Details & Co" });
+  assert.equal(plain.body.tax.pan, "ABCDE1234F");
+  assert.equal(plain.body.name, "Details & Co");
+});
+
 server.kill();
 await db.dropDatabase(); await mongoose.disconnect();
 console.log(`\n${passed} passed`);

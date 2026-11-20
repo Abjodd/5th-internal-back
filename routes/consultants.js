@@ -76,16 +76,15 @@ function ugc(u) {
   };
 }
 
-/** The writable fields present in `body`, cleaned. Sections are replaced whole. */
-async function clean(body, { creating = false } = {}) {
+/**
+ * The business-detail sections a consultant and a brand share — billing, HQ,
+ * tax, primary contact and POCs — cleaned the same way for both. Only the
+ * sections present in `b` are returned; each is replaced whole.
+ * Used by PATCH /api/clients/:id (server.js) for Settings → Brand Settings.
+ */
+export function cleanBusinessDetails(body) {
   const b = body || {};
   const out = {};
-  if (creating || "name" in b) {
-    out.name = str(b.name, 160);
-    if (!out.name) throw new BadInput("Name is required.");
-  }
-  if ("email" in b) out.email = email(b.email, "Email");
-  if ("status" in b) out.status = b.status === "inactive" ? "inactive" : "active";
   if ("billing" in b) {
     const x = b.billing || {};
     out.billing = { gstNumber: gst(x.gstNumber, "GST number"), address: str(x.address, 600), gst: gst(x.gst, "Billing GST"), email: email(x.email, "Billing email") };
@@ -103,6 +102,20 @@ async function clean(body, { creating = false } = {}) {
     if (!Array.isArray(b.pocs)) throw new BadInput("POCs must be a list.");
     out.pocs = b.pocs.slice(0, 50).map((p, i) => person(p, `POC ${i + 1}`)).filter((p) => p.name || p.email || p.phone);
   }
+  return out;
+}
+
+/** The writable fields present in `body`, cleaned. Sections are replaced whole. */
+async function clean(body, { creating = false } = {}) {
+  const b = body || {};
+  const out = {};
+  if (creating || "name" in b) {
+    out.name = str(b.name, 160);
+    if (!out.name) throw new BadInput("Name is required.");
+  }
+  if ("email" in b) out.email = email(b.email, "Email");
+  if ("status" in b) out.status = b.status === "inactive" ? "inactive" : "active";
+  Object.assign(out, cleanBusinessDetails(b));
   if ("brandIds" in b) {
     if (!Array.isArray(b.brandIds)) throw new BadInput("Brands must be a list.");
     const ids = [...new Set(b.brandIds.map((x) => str(x, 120)).filter(Boolean))];

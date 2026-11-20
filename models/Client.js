@@ -33,6 +33,14 @@ const ClientSchema = new mongoose.Schema(
     lastScanned: String,
     confidence: String,
     profile: mongoose.Schema.Types.Mixed,
+    // Brand details — Settings → Brand Settings. Same shapes as a consultant's
+    // (models/Consultant.js), cleaned by cleanBusinessDetails() in
+    // routes/consultants.js on PATCH /api/clients/:id.
+    billing: { gstNumber: String, address: String, gst: String, email: String },
+    hq: { address: String, gst: String },
+    tax: { tin: String, pan: String },
+    primaryContact: mongoose.Schema.Types.Mixed, // { _id, name, designation, email, phone }
+    pocs: { type: [mongoose.Schema.Types.Mixed], default: undefined },
     openRecs: Number,
     openTasks: Number,
     activeProjects: Number,

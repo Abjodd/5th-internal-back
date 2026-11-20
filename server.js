@@ -8,7 +8,7 @@ import Invoice from "./models/Invoice.js";
 import invoicePdfRoutes from "./routes/invoicePdf.js";
 import authRoutes from "./routes/auth.js";
 import creatorRoutes from "./routes/creators.js";
-import consultantRoutes from "./routes/consultants.js";
+import consultantRoutes, { cleanBusinessDetails } from "./routes/consultants.js";
 import consultantPortalRoutes from "./routes/consultantPortal.js";
 import Consultant from "./models/Consultant.js";
 import { keyOf, splitCreatorsForStorage, hydrateCampaignCreators } from "./creatorSync.js";
@@ -1295,8 +1295,12 @@ app.patch("/api/clients/:id", async (req, res) => {
     const patch = { ...req.body };
     // Absent = logo untouched; null = removed; data URI = replaced. An edit to
     // any other field must not disturb the logo.
-    try { withAvatar(patch, req.body); }
-    catch (e) { return res.status(400).json({ error: e.message }); }
+    //
+    // Brand details (Settings → Brand Settings: billing, HQ, tax, primary
+    // contact, POCs) are cleaned exactly as a consultant's are — GSTIN, PAN,
+    // TIN and emails checked, only known fields kept.
+    try { withAvatar(patch, req.body); Object.assign(patch, cleanBusinessDetails(req.body)); }
+    catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
     const updated = await Client.findByIdAndUpdate(
       req.params.id,
       { $set: patch },
